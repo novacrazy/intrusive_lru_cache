@@ -1,0 +1,10 @@
+[package]
+name = "intrusive_lru_map"
+version = "0.1.0"
+edition = "2021"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+include = ["src/**/*", "LICENSE-*", "README.md"]
+
+[dependencies]
+intrusive-collections = "0.9.7"
