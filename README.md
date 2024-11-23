@@ -7,3 +7,6 @@ Intrusive LRU Cache
 
 This crate provides an LRU Cache implementation that is based on combining an intrusive doubly linked list and an intrusive red-black tree,
 in the same node. Both data structures share the same allocations, which makes it quite efficient for a linked structure.
+
+## Cargo Features
+- atomic (default): Enables atomic links within the intrusive structures, allowing for concurrent access.
