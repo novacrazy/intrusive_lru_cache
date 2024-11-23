@@ -1,6 +1,6 @@
 [package]
-name = "intrusive_lru_map"
-version = "0.1.0"
+name = "intrusive-lru-cache"
+version = "0.1.0-alpha.1"
 edition = "2021"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

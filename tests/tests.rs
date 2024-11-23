@@ -1,4 +1,4 @@
-use intrusive_lru_map::LRUCache;
+use intrusive_lru_cache::LRUCache;
 
 #[test]
 fn test_unsync_lru() {
