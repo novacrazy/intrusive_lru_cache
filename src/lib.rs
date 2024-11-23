@@ -11,38 +11,6 @@ use intrusive_collections::intrusive_adapter;
 use intrusive_collections::rbtree::Entry as RBTreeEntry;
 use intrusive_collections::{KeyAdapter, LinkedList, LinkedListLink, RBTree, RBTreeLink};
 
-// Because KeyAdapter returns a reference, and `find` uses the returned type as `K`,
-// I ran into issues where `&K: Borrow<Q>` was not satisfied. Therefore, we need
-// to convince the compiler that some `Q` can be borrowed from `&K` by using a
-// transparent wrapper type for both halves, and casting `&Q` to `&Borrowed<Q>`.
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-struct Key<K>(K);
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-struct Borrowed<Q: ?Sized>(Q);
-
-impl<'a, Q: ?Sized> Borrowed<Q> {
-    #[inline(always)]
-    const fn new(value: &'a Q) -> &'a Self {
-        // SAFETY: &Q == &Borrowed<Q> due to transparent repr
-        unsafe { core::mem::transmute(value) }
-    }
-}
-
-// Magic that allows `&K: Borrow<Q>` to be satisfied
-impl<K, Q: ?Sized> Borrow<Borrowed<Q>> for Key<&K>
-where
-    K: Borrow<Q>,
-{
-    #[inline(always)]
-    fn borrow(&self) -> &Borrowed<Q> {
-        Borrowed::new(self.0.borrow())
-    }
-}
-
 struct Entry<K, V> {
     list_link: LinkedListLink,
     tree_link: RBTreeLink,
@@ -76,6 +44,38 @@ impl<K, V> Entry<K, V> {
 intrusive_adapter!(EntryListAdapter<K, V> = Rc<Entry<K, V>>: Entry<K, V> { list_link: LinkedListLink });
 intrusive_adapter!(EntryTreeAdapter<K, V> = Rc<Entry<K, V>>: Entry<K, V> { tree_link: RBTreeLink });
 
+// Because KeyAdapter returns a reference, and `find` uses the returned type as `K`,
+// I ran into issues where `&K: Borrow<Q>` was not satisfied. Therefore, we need
+// to convince the compiler that some `Q` can be borrowed from `&K` by using a
+// transparent wrapper type for both halves, and casting `&Q` to `&Borrowed<Q>`.
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct Key<K>(K);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct Borrowed<Q: ?Sized>(Q);
+
+impl<'a, Q: ?Sized> Borrowed<Q> {
+    #[inline(always)]
+    const fn new(value: &'a Q) -> &'a Self {
+        // SAFETY: &Q == &Borrowed<Q> due to transparent repr
+        unsafe { core::mem::transmute(value) }
+    }
+}
+
+// Magic that allows `&K: Borrow<Q>` to be satisfied
+impl<K, Q: ?Sized> Borrow<Borrowed<Q>> for Key<&K>
+where
+    K: Borrow<Q>,
+{
+    #[inline(always)]
+    fn borrow(&self) -> &Borrowed<Q> {
+        Borrowed::new(self.0.borrow())
+    }
+}
+
 impl<'a, K: 'a, V> KeyAdapter<'a> for EntryTreeAdapter<K, V> {
     type Key = Key<&'a K>; // Allows `Key<&K>: Borrow<Borrowed<Q>>`
 
@@ -86,10 +86,42 @@ impl<'a, K: 'a, V> KeyAdapter<'a> for EntryTreeAdapter<K, V> {
     }
 }
 
+/// LRU Cache implementation using intrusive collections.
+///
+/// This cache uses an [`intrusive_collections::LinkedList`] to maintain the LRU order,
+/// and an [`intrusive_collections::RBTree`] to allow for efficient lookups by key,
+/// while maintaining only one allocation per key-value pair. Unfortunately, this
+/// is a linked structure, so cache locality is likely poor, but memory usage
+/// and flexibility are improved.
+///
+/// The cache is unbounded by default, but can be limited to a maximum capacity.
+///
+/// # Example
+/// ```rust
+/// use intrusive_lru_cache::LRUCache;
+///
+/// let mut lru: LRUCache<&'static str, &'static str> = LRUCache::default();
+///
+/// lru.insert("a", "1");
+/// lru.insert("b", "2");
+/// lru.insert("c", "3");
+///
+/// let _ = lru.get("b"); // updates LRU order
+///
+/// assert_eq!(lru.pop(), Some(("a", "1")));
+/// assert_eq!(lru.pop(), Some(("c", "3")));
+/// assert_eq!(lru.pop(), Some(("b", "2")));
+/// assert_eq!(lru.pop(), None);
+/// ```
+///
+/// # Notes
+///
+/// - The cache is not thread-safe, and requires external synchronization.
+/// - Cloning the cache will preserve the LRU order.
 pub struct LRUCache<K, V> {
     list: LinkedList<EntryListAdapter<K, V>>,
     tree: RBTree<EntryTreeAdapter<K, V>>,
-    len: usize,
+    size: usize,
     max_capacity: usize,
 }
 
@@ -111,7 +143,7 @@ impl<K, V> LRUCache<K, V> {
         Self {
             list: LinkedList::new(EntryListAdapter::new()),
             tree: RBTree::new(EntryTreeAdapter::new()),
-            len: 0,
+            size: 0,
             max_capacity,
         }
     }
@@ -120,6 +152,23 @@ impl<K, V> LRUCache<K, V> {
 impl<K, V> Default for LRUCache<K, V> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<K, V> Clone for LRUCache<K, V>
+where
+    K: Clone + Ord + 'static,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        let mut new = Self::new_with_max_capacity(self.max_capacity);
+
+        // preserves the LRU ordering
+        for (key, value) in self.iter_lru() {
+            new.insert(key.clone(), value.clone());
+        }
+
+        new
     }
 }
 
@@ -191,7 +240,7 @@ where
                 cursor.insert(entry.clone());
                 self.list.push_front(entry);
 
-                self.len += 1;
+                self.size += 1;
 
                 self.shrink();
 
@@ -216,7 +265,7 @@ where
                 .expect("tree and list are inconsistent")
         };
 
-        self.len -= 1;
+        self.size -= 1;
 
         let Ok(Entry { value, .. }) = Rc::try_unwrap(entry) else {
             unreachable!("tree and list are inconsistent")
@@ -234,30 +283,79 @@ impl<K, V> LRUCache<K, V> {
     ///
     /// Use [`shrink`](Self::shrink) to manually trigger removal of entries
     /// to meet the new capacity.
+    #[inline(always)]
     pub fn set_max_capacity(&mut self, max_capacity: usize) {
         self.max_capacity = max_capacity;
     }
 
-    /// Removes entries from the cache until the length is less than or equal to the maximum capacity.
+    /// Clears the cache, removing all key-value pairs.
+    ///
+    /// This is `O(2n)` where n is the number of key-value pairs in the cache,
+    /// as both the LRU list _and_ key-value tree require iteration to be cleared.
+    pub fn clear(&mut self) {
+        self.list.clear();
+        self.tree.clear();
+    }
+
+    /// Removes the oldest entries from the cache until the length is less than or equal to the maximum capacity.
     pub fn shrink(&mut self) {
-        while self.len > self.max_capacity {
+        while self.size > self.max_capacity {
             let _ = self.pop();
         }
     }
 
+    /// Removes the oldest entries from the cache until the length is less than or equal to the maximum capacity,
+    /// and calls the provided closure with the removed key-value pairs.
+    ///
+    /// # Example
+    /// ```rust
+    /// # use intrusive_lru_cache::LRUCache;
+    /// let mut lru: LRUCache<&'static str, &'static str> = LRUCache::default();
+    ///
+    /// lru.insert("a", "1");
+    /// lru.insert("b", "2");
+    /// lru.insert("c", "3");
+    ///
+    /// lru.set_max_capacity(1);
+    ///
+    /// let mut removed = Vec::new();
+    ///
+    /// lru.shrink_with(|key, value| {
+    ///    removed.push((key, value));
+    /// });
+    ///
+    /// assert_eq!(removed, vec![("a", "1"), ("b", "2")]);
+    /// ```
+    pub fn shrink_with<F>(&mut self, mut cb: F)
+    where
+        F: FnMut(K, V),
+    {
+        while self.size > self.max_capacity {
+            let Some((key, value)) = self.pop() else {
+                break;
+            };
+
+            cb(key, value);
+        }
+    }
+
     /// Returns the number of key-value pairs in the cache.
-    pub fn len(&self) -> usize {
-        self.len
+    #[inline(always)]
+    pub const fn len(&self) -> usize {
+        self.size
     }
 
     /// Returns `true` if the cache is empty.
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        debug_assert_eq!(self.len == 0, self.list.is_empty());
+        debug_assert_eq!(self.size == 0, self.list.is_empty());
 
-        self.len == 0
+        self.size == 0
     }
 
     /// Removes and returns the least recently used key-value pair.
+    ///
+    /// This is an `O(1)` operation.
     pub fn pop(&mut self) -> Option<(K, V)> {
         let entry = self.list.pop_back()?;
 
@@ -268,7 +366,93 @@ impl<K, V> LRUCache<K, V> {
                 .expect("tree and list are inconsistent")
         };
 
-        self.len -= 1;
+        self.size -= 1;
+
+        let Ok(Entry { key, value, .. }) = Rc::try_unwrap(entry) else {
+            unreachable!("tree and list are inconsistent")
+        };
+
+        Some((key, value.into_inner()))
+    }
+
+    /// Returns an iterator over the key-value pairs in the cache,
+    /// in order of least recently used to most recently used.
+    pub fn iter_lru(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
+        self.list.iter().map(|entry| (&entry.key, entry.value()))
+    }
+
+    /// Returns an iterator over the key-value pairs in the cache,
+    /// in order of key `Ord` order.
+    pub fn iter_ord(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
+        self.tree.iter().map(|entry| (&entry.key, entry.value()))
+    }
+}
+
+impl<K, V> Extend<(K, V)> for LRUCache<K, V>
+where
+    K: Ord + 'static,
+{
+    fn extend<T>(&mut self, iter: T)
+    where
+        T: IntoIterator<Item = (K, V)>,
+    {
+        for (key, value) in iter {
+            self.insert(key, value);
+        }
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for LRUCache<K, V>
+where
+    K: Ord + 'static,
+{
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = (K, V)>,
+    {
+        let mut cache = Self::new();
+        cache.extend(iter);
+        cache
+    }
+}
+
+pub struct IntoIter<K, V> {
+    inner: intrusive_collections::linked_list::IntoIter<EntryListAdapter<K, V>>,
+}
+
+impl<K, V> IntoIterator for LRUCache<K, V>
+where
+    K: Ord + 'static,
+{
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        self.tree.clear();
+
+        IntoIter {
+            inner: self.list.into_iter(),
+        }
+    }
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.inner.next()?;
+
+        let Ok(Entry { key, value, .. }) = Rc::try_unwrap(entry) else {
+            unreachable!("tree and list are inconsistent")
+        };
+
+        Some((key, value.into_inner()))
+    }
+}
+
+impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let entry = self.inner.next_back()?;
 
         let Ok(Entry { key, value, .. }) = Rc::try_unwrap(entry) else {
             unreachable!("tree and list are inconsistent")
