@@ -15,36 +15,35 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::borrow::Borrow;
 use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
 
 use intrusive_collections::intrusive_adapter;
 use intrusive_collections::rbtree::Entry as RBTreeEntry;
-use intrusive_collections::{
-    KeyAdapter, LinkedList, LinkedListLink, RBTree, RBTreeLink, UnsafeRef,
-};
+use intrusive_collections::{KeyAdapter, LinkedList, RBTree, UnsafeRef};
+
+#[cfg(feature = "atomic")]
+use intrusive_collections::{LinkedListAtomicLink as LinkedListLink, RBTreeAtomicLink as RBTreeLink};
+
+#[cfg(not(feature = "atomic"))]
+use intrusive_collections::{LinkedListLink, RBTreeLink};
 
 struct Entry<K, V> {
-    list_link: LinkedListLink,
-    tree_link: RBTreeLink,
     key: K,
     value: UnsafeCell<V>,
 }
 
 impl<K, V> Entry<K, V> {
     #[inline(always)]
-    fn new(key: K, value: V) -> UnsafeRef<Self> {
-        UnsafeRef::from_box(Box::new(Self {
-            list_link: LinkedListLink::new(),
-            tree_link: RBTreeLink::new(),
-            key,
-            value: UnsafeCell::new(value),
-        }))
-    }
-
-    #[inline(always)]
     fn value(&self) -> &V {
         // SAFETY: Read-only access to value is safe in conjunction with
         // the guarantees of other methods.
         unsafe { &*self.value.get() }
+    }
+
+    // SAFETY: Only use with exclusive access to the Entry
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn value_mut(&self) -> &mut V {
+        &mut *self.value.get()
     }
 
     /// SAFETY: Only use with exclusive access to the Entry
@@ -54,8 +53,46 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-intrusive_adapter!(EntryListAdapter<K, V> = UnsafeRef<Entry<K, V>>: Entry<K, V> { list_link: LinkedListLink });
-intrusive_adapter!(EntryTreeAdapter<K, V> = UnsafeRef<Entry<K, V>>: Entry<K, V> { tree_link: RBTreeLink });
+// SAFETY: Entry is Send and Sync if K and V are Send and Sync,
+// because the `UnsafeCell<V>` is only accessed with exclusive access to the Entry.
+unsafe impl<K, V> Send for Entry<K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+// SAFETY: Entry is Send and Sync if K and V are Send and Sync,
+// because the `UnsafeCell<V>` is only accessed with exclusive access to the Entry.
+unsafe impl<K, V> Sync for Entry<K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+struct Node<K, V> {
+    list_link: LinkedListLink,
+    tree_link: RBTreeLink,
+    entry: Entry<K, V>,
+}
+
+impl<K, V> Node<K, V> {
+    #[inline(always)]
+    fn new(key: K, value: V) -> UnsafeRef<Self> {
+        UnsafeRef::from_box(Box::new(Self {
+            list_link: LinkedListLink::new(),
+            tree_link: RBTreeLink::new(),
+            entry: Entry {
+                key,
+                value: UnsafeCell::new(value),
+            },
+        }))
+    }
+}
+
+intrusive_adapter!(EntryListAdapter<K, V> = UnsafeRef<Node<K, V>>: Node<K, V> { list_link: LinkedListLink });
+intrusive_adapter!(EntryTreeAdapter<K, V> = UnsafeRef<Node<K, V>>: Node<K, V> { tree_link: RBTreeLink });
 
 // Because KeyAdapter returns a reference, and `find` uses the returned type as `K`,
 // I ran into issues where `&K: Borrow<Q>` was not satisfied. Therefore, we need
@@ -93,9 +130,9 @@ impl<'a, K: 'a, V> KeyAdapter<'a> for EntryTreeAdapter<K, V> {
     type Key = Key<&'a K>; // Allows `Key<&K>: Borrow<Borrowed<Q>>`
 
     #[inline(always)]
-    fn get_key(&self, value: &'a Entry<K, V>) -> Self::Key {
+    fn get_key(&self, value: &'a Node<K, V>) -> Self::Key {
         // SAFETY: &K == Key<&K> == &Key<K> due to transparent repr
-        unsafe { core::mem::transmute(&value.key) }
+        unsafe { core::mem::transmute(&value.entry.key) }
     }
 }
 
@@ -177,8 +214,8 @@ where
     fn clone(&self) -> Self {
         let mut new = Self::new_with_max_capacity(self.max_capacity);
 
-        // preserves the LRU ordering
-        for (key, value) in self.iter_lru() {
+        // preserves the LRU ordering by placing the oldest in first
+        for (key, value) in self.iter_lru().rev() {
             new.insert(key.clone(), value.clone());
         }
 
@@ -197,19 +234,19 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let entry = self.tree.find(Borrowed::new(key)).get()?;
+        let node = self.tree.find(Borrowed::new(key)).get()?;
 
         // SAFETY: Cursor created from a known valid pointer
         let cursor = unsafe {
             self.list
-                .cursor_mut_from_ptr(entry)
+                .cursor_mut_from_ptr(node)
                 .remove()
                 .expect("tree and list are inconsistent")
         };
 
         self.list.front_mut().insert_before(cursor);
 
-        Some(entry.value())
+        Some(node.entry.value())
     }
 
     /// Returns a reference to the value corresponding to the key,
@@ -222,7 +259,7 @@ where
         self.tree
             .find(Borrowed::new(key))
             .get()
-            .map(|entry| entry.value())
+            .map(|node| node.entry.value())
     }
 
     /// Inserts a key-value pair into the cache, returning
@@ -231,17 +268,17 @@ where
         match self.tree.entry(Borrowed::new(&key)) {
             // SAFETY: We treat the cursor as a mutable reference, and only use known valid pointers
             RBTreeEntry::Occupied(cursor) => unsafe {
-                let entry = cursor.get().unwrap();
+                let node = cursor.get().unwrap();
 
                 // NOTE: Treat cursor/entry as if it were mutable for replace_value
                 // since we can't ever actually acquire a mutable reference to the entry
                 // as per the restrictions of `intrusive_collections`
-                let old_value = entry.replace_value(value);
+                let old_value = node.entry.replace_value(value);
 
                 // remove and reinsert at front to update LRU order
                 let lru = self
                     .list
-                    .cursor_mut_from_ptr(entry)
+                    .cursor_mut_from_ptr(node)
                     .remove()
                     .expect("tree and list are inconsistent");
 
@@ -250,10 +287,10 @@ where
                 Some(old_value)
             },
             RBTreeEntry::Vacant(cursor) => {
-                let entry = Entry::new(key, value);
+                let node = Node::new(key, value);
 
-                cursor.insert(entry.clone());
-                self.list.push_front(entry);
+                cursor.insert(node.clone());
+                self.list.push_front(node);
 
                 self.size += 1;
 
@@ -271,12 +308,12 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let entry = self.tree.find_mut(Borrowed::new(key)).remove()?;
+        let node = self.tree.find_mut(Borrowed::new(key)).remove()?;
 
         // SAFETY: Cursor created from a known valid pointer
         let _ = unsafe {
             self.list
-                .cursor_mut_from_ptr(&*entry)
+                .cursor_mut_from_ptr(&*node)
                 .remove()
                 .expect("tree and list are inconsistent")
         };
@@ -284,9 +321,101 @@ where
         self.size -= 1;
 
         // SAFETY: entry is removed from both the tree and list
-        let Entry { value, .. } = unsafe { *UnsafeRef::into_box(entry) };
+        let Node { entry, .. } = unsafe { *UnsafeRef::into_box(node) };
 
-        Some(value.into_inner())
+        Some(entry.value.into_inner())
+    }
+
+    /// Inserts a key-value pair into the cache only if it wasn't already present,
+    /// otherwise update the LRU order for this element and return a reference to the value.
+    ///
+    /// The returned value contains a mutable reference to the value, and if the key already existed,
+    /// it also contains the key and value that were passed in.
+    pub fn insert_or_get(&mut self, key: K, value: V) -> GetOrInsertResult<'_, K, V> {
+        let kv = match self.tree.entry(Borrowed::new(&key)) {
+            // SAFETY: Cursor is a valid pointer here in both the tree and list
+            RBTreeEntry::Occupied(cursor) => unsafe {
+                let node = cursor.get().unwrap();
+
+                // remove and reinsert at front to update LRU order
+                let lru = self
+                    .list
+                    .cursor_mut_from_ptr(node)
+                    .remove()
+                    .expect("tree and list are inconsistent");
+
+                self.list.push_front(lru);
+
+                Some((key, value))
+            },
+            RBTreeEntry::Vacant(cursor) => {
+                let node = Node::new(key, value);
+
+                cursor.insert(node.clone());
+                self.list.push_front(node);
+
+                self.size += 1;
+
+                self.shrink();
+
+                None
+            }
+        };
+
+        // SAFETY: We have `&mut self` and the list is valid given the above logic
+        // the element we want was _just_ repositioned to the front
+        let v = unsafe { self.list.front_mut().into_ref().unwrap().entry.value_mut() };
+
+        match kv {
+            Some((key, value)) => GetOrInsertResult::Existed(v, key, value),
+            None => GetOrInsertResult::Inserted(v),
+        }
+    }
+}
+
+/// The result of [`LRUCache::insert_or_get`](LRUCache::insert_or_get).
+///
+/// If inserted, it returns a reference to the newly inserted value.
+/// If the key already existed, it returns a reference to the existing value, the key and the value.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GetOrInsertResult<'a, K, V> {
+    /// Element was inserted, key and value were consumed.
+    Inserted(&'a mut V),
+
+    /// Element already existed at the given key, so a reference
+    /// to the existing value is returned, along with the given key and value.
+    Existed(&'a mut V, K, V),
+}
+
+impl<'a, K, V> GetOrInsertResult<'a, K, V> {
+    /// Consumes the result and returns a reference to the value.
+    ///
+    /// This will drop the key and value if they existed.
+    pub fn into_inner(self) -> &'a mut V {
+        match self {
+            Self::Inserted(value) => value,
+            Self::Existed(value, _, _) => value,
+        }
+    }
+}
+
+impl<K, V> Deref for GetOrInsertResult<'_, K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Inserted(value) => value,
+            Self::Existed(value, _, _) => value,
+        }
+    }
+}
+
+impl<K, V> DerefMut for GetOrInsertResult<'_, K, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Inserted(value) => value,
+            Self::Existed(value, _, _) => value,
+        }
     }
 }
 
@@ -309,9 +438,9 @@ impl<K, V> LRUCache<K, V> {
 
         let mut front = self.list.front_mut();
 
-        while let Some(entry) = front.remove() {
+        while let Some(node) = front.remove() {
             // SAFETY: entry is removed from both the tree and list
-            let _ = unsafe { UnsafeRef::into_box(entry) };
+            let _ = unsafe { UnsafeRef::into_box(node) };
         }
     }
 
@@ -377,12 +506,12 @@ impl<K, V> LRUCache<K, V> {
     ///
     /// This is an `O(1)` operation.
     pub fn pop(&mut self) -> Option<(K, V)> {
-        let entry = self.list.pop_back()?;
+        let node = self.list.pop_back()?;
 
         // SAFETY: Cursor created from a known valid pointer
         let _ = unsafe {
             self.tree
-                .cursor_mut_from_ptr(&*entry)
+                .cursor_mut_from_ptr(&*node)
                 .remove()
                 .expect("tree and list are inconsistent")
         };
@@ -390,23 +519,27 @@ impl<K, V> LRUCache<K, V> {
         self.size -= 1;
 
         // SAFETY: entry is removed from both the tree and list
-        let Entry { key, value, .. } = unsafe { *UnsafeRef::into_box(entry) };
+        let Entry { key, value } = unsafe { UnsafeRef::into_box(node).entry };
 
         Some((key, value.into_inner()))
     }
 
     /// Returns an iterator over the key-value pairs in the cache,
-    /// in order of least recently used to most recently used.
+    /// in order of most recently used to least recently used.
     #[must_use]
     pub fn iter_lru(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
-        self.list.iter().map(|entry| (&entry.key, entry.value()))
+        self.list
+            .iter()
+            .map(|Node { entry, .. }| (&entry.key, entry.value()))
     }
 
     /// Returns an iterator over the key-value pairs in the cache,
     /// in order of key `Ord` order.
     #[must_use]
     pub fn iter_ord(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
-        self.tree.iter().map(|entry| (&entry.key, entry.value()))
+        self.tree
+            .iter()
+            .map(|Node { entry, .. }| (&entry.key, entry.value()))
     }
 }
 
@@ -445,7 +578,7 @@ where
 }
 
 /// An owning iterator over the key-value pairs in the cache,
-/// in order of least recently used to most recently used.
+/// in order of most recently used to least recently used.
 pub struct IntoIter<K, V> {
     inner: intrusive_collections::linked_list::IntoIter<EntryListAdapter<K, V>>,
 }
@@ -473,10 +606,10 @@ impl<K, V> Iterator for IntoIter<K, V> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.inner.next()?;
+        let node = self.inner.next()?;
 
         // SAFETY: entry is removed from both the tree and list
-        let Entry { key, value, .. } = unsafe { *UnsafeRef::into_box(entry) };
+        let Entry { key, value } = unsafe { UnsafeRef::into_box(node).entry };
 
         Some((key, value.into_inner()))
     }
@@ -484,10 +617,10 @@ impl<K, V> Iterator for IntoIter<K, V> {
 
 impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let entry = self.inner.next_back()?;
+        let node = self.inner.next_back()?;
 
         // SAFETY: entry is removed from both the tree and list
-        let Entry { key, value, .. } = unsafe { *UnsafeRef::into_box(entry) };
+        let Entry { key, value } = unsafe { UnsafeRef::into_box(node).entry };
 
         Some((key, value.into_inner()))
     }

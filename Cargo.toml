@@ -1,6 +1,6 @@
 [package]
 name = "intrusive-lru-cache"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2021"
 authors = ["novacrazy <novacrazy@gmail.com>"]
 description = "An LRU cache implementation using intrusive data structures"
@@ -14,3 +14,7 @@ documentation = "https://docs.rs/intrusive-lru-cache"
 
 [dependencies]
 intrusive-collections = "0.9.7"
+
+[features]
+default = ["atomic"]
+atomic = []
