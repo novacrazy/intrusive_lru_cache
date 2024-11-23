@@ -163,11 +163,6 @@ impl<'a, K: 'a, V> KeyAdapter<'a> for EntryTreeAdapter<K, V> {
 /// assert_eq!(lru.pop(), Some(("b", "2")));
 /// assert_eq!(lru.pop(), None);
 /// ```
-///
-/// # Notes
-///
-/// - The cache is not thread-safe, and requires external synchronization.
-/// - Cloning the cache will preserve the LRU order.
 #[must_use]
 pub struct LRUCache<K, V> {
     list: LinkedList<EntryListAdapter<K, V>>,
@@ -272,7 +267,7 @@ where
         match self.tree.entry(Borrowed::new(&key)) {
             // SAFETY: We treat the cursor as a mutable reference, and only use known valid pointers
             RBTreeEntry::Occupied(cursor) => unsafe {
-                let node = cursor.get().unwrap();
+                let node = cursor.get().unwrap_unchecked();
 
                 // NOTE: Treat cursor/entry as if it were mutable for replace_value
                 // since we can't ever actually acquire a mutable reference to the entry
@@ -339,7 +334,7 @@ where
         let kv = match self.tree.entry(Borrowed::new(&key)) {
             // SAFETY: Cursor is a valid pointer here in both the tree and list
             RBTreeEntry::Occupied(cursor) => unsafe {
-                let node = cursor.get().unwrap();
+                let node = cursor.get().unwrap_unchecked();
 
                 // remove and reinsert at front to update LRU order
                 let lru = self
@@ -368,7 +363,14 @@ where
 
         // SAFETY: We have `&mut self` and the list is valid given the above logic
         // the element we want was _just_ repositioned to the front
-        let v = unsafe { self.list.front_mut().into_ref().unwrap().entry.value_mut() };
+        let v = unsafe {
+            self.list
+                .front_mut()
+                .into_ref()
+                .unwrap_unchecked()
+                .entry
+                .value_mut()
+        };
 
         match kv {
             Some((key, value)) => InsertOrGetResult::Existed(v, key, value),

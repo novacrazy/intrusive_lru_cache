@@ -13,4 +13,9 @@ fn test_lru_cache() {
     assert_eq!(lru.pop(), Some(("c", "3")));
     assert_eq!(lru.pop(), Some(("b", "2")));
     assert_eq!(lru.pop(), None);
+
+    lru.insert_or_get("a", "1");
+    lru.insert_or_get("a", "1");
+
+    lru.remove("a");
 }
