@@ -192,11 +192,10 @@ where
 {
     /// Returns a reference to the value corresponding to the key,
     /// and bumps the key to the front of the LRU list.
-    pub fn get<'a, 'b, Q>(&'a mut self, key: &Q) -> Option<&'a V>
+    pub fn get<'a, Q>(&'a mut self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
-        'a: 'b,
     {
         let entry = self.tree.find(Borrowed::new(key)).get()?;
 
@@ -215,11 +214,10 @@ where
 
     /// Returns a reference to the value corresponding to the key,
     /// without updating the LRU list.
-    pub fn peek<'a, 'b, Q>(&'a self, key: &Q) -> Option<&'a V>
+    pub fn peek<'a, Q>(&'a self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
-        'a: 'b,
     {
         self.tree
             .find(Borrowed::new(key))
