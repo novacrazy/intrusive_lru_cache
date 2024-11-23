@@ -229,7 +229,10 @@ where
 {
     /// Returns a reference to the value corresponding to the key,
     /// and bumps the key to the front of the LRU list.
-    pub fn get<'a, Q>(&'a mut self, key: &Q) -> Option<&'a V>
+    ///
+    /// This returns a mutable reference to the value because
+    /// we already have a mutable reference to the cache.
+    pub fn get<'a, Q>(&'a mut self, key: &Q) -> Option<&'a mut V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -246,7 +249,8 @@ where
 
         self.list.front_mut().insert_before(cursor);
 
-        Some(node.entry.value())
+        // SAFETY: We have `&mut self`
+        Some(unsafe { node.entry.value_mut() })
     }
 
     /// Returns a reference to the value corresponding to the key,
