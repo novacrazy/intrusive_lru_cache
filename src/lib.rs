@@ -331,7 +331,7 @@ where
     ///
     /// The returned value contains a mutable reference to the value, and if the key already existed,
     /// it also contains the key and value that were passed in.
-    pub fn insert_or_get(&mut self, key: K, value: V) -> GetOrInsertResult<'_, K, V> {
+    pub fn insert_or_get(&mut self, key: K, value: V) -> InsertOrGetResult<'_, K, V> {
         let kv = match self.tree.entry(Borrowed::new(&key)) {
             // SAFETY: Cursor is a valid pointer here in both the tree and list
             RBTreeEntry::Occupied(cursor) => unsafe {
@@ -367,8 +367,8 @@ where
         let v = unsafe { self.list.front_mut().into_ref().unwrap().entry.value_mut() };
 
         match kv {
-            Some((key, value)) => GetOrInsertResult::Existed(v, key, value),
-            None => GetOrInsertResult::Inserted(v),
+            Some((key, value)) => InsertOrGetResult::Existed(v, key, value),
+            None => InsertOrGetResult::Inserted(v),
         }
     }
 }
@@ -378,7 +378,7 @@ where
 /// If inserted, it returns a reference to the newly inserted value.
 /// If the key already existed, it returns a reference to the existing value, the key and the value.
 #[derive(Debug, PartialEq, Eq)]
-pub enum GetOrInsertResult<'a, K, V> {
+pub enum InsertOrGetResult<'a, K, V> {
     /// Element was inserted, key and value were consumed.
     Inserted(&'a mut V),
 
@@ -387,7 +387,7 @@ pub enum GetOrInsertResult<'a, K, V> {
     Existed(&'a mut V, K, V),
 }
 
-impl<'a, K, V> GetOrInsertResult<'a, K, V> {
+impl<'a, K, V> InsertOrGetResult<'a, K, V> {
     /// Consumes the result and returns a reference to the value.
     ///
     /// This will drop the key and value if they existed.
@@ -399,7 +399,7 @@ impl<'a, K, V> GetOrInsertResult<'a, K, V> {
     }
 }
 
-impl<K, V> Deref for GetOrInsertResult<'_, K, V> {
+impl<K, V> Deref for InsertOrGetResult<'_, K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -410,7 +410,7 @@ impl<K, V> Deref for GetOrInsertResult<'_, K, V> {
     }
 }
 
-impl<K, V> DerefMut for GetOrInsertResult<'_, K, V> {
+impl<K, V> DerefMut for InsertOrGetResult<'_, K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             Self::Inserted(value) => value,
