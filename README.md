@@ -9,4 +9,5 @@ This crate provides an LRU Cache implementation that is based on combining an in
 in the same node. Both data structures share the same allocations, which makes it quite efficient for a linked structure.
 
 ## Cargo Features
-- atomic (default): Enables atomic links within the intrusive structures, allowing for concurrent access.
+- `atomic` (default): Enables atomic links within the intrusive structures, making it thread-safe if
+    `K` and `V` are `Send`/`Sync`. If you disable this feature, you can still use the cache in a single-threaded context.
