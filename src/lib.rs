@@ -240,13 +240,13 @@ fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
     }
 
     // SAFETY: Cursor created from a known valid pointer
-    let cursor = unsafe { list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+    let node = unsafe { list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
 
     // NOTE: Not a good idea to reuse the `front` cursor here, as it's potentially
     // invalidated by the `remove` call above. Emphasis on potentially,
     // as that might only happen if the cursor is at the front of the list,
     // which we checked for, but it's better to be safe.
-    list.front_mut().insert_before(cursor);
+    list.front_mut().insert_before(node);
 }
 
 impl<K, V> LRUCache<K, V>
