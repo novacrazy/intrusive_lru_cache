@@ -12,7 +12,9 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+
 use core::borrow::Borrow;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -516,7 +518,6 @@ where
                 self.list.push_front(node);
 
                 self.size += 1;
-
                 self.shrink();
 
                 None
@@ -567,6 +568,8 @@ where
     /// This is similar to [`insert_or_get`](Self::insert_or_get), but for cases
     /// where the value is likely to be found in the cache already.
     ///
+    /// See also [`get_or_insert2`](Self::get_or_insert2) for a version that allows for a borrowed key type.
+    ///
     /// This is an `O(log n)` operation.
     pub fn get_or_insert<F>(&mut self, key: K, f: F) -> GetOrInsertResult<K, V>
     where
@@ -586,7 +589,6 @@ where
                 self.list.push_front(node);
 
                 self.size += 1;
-
                 self.shrink();
 
                 None
@@ -607,6 +609,59 @@ where
         match key {
             Some(key) => GetOrInsertResult::Existed(v, key),
             None => GetOrInsertResult::Inserted(v),
+        }
+    }
+
+    /// Like [`get_or_insert`](Self::get_or_insert), but allows for a different borrowed key
+    /// type, so long as it can be made into an owned key of type `K`.
+    ///
+    /// Because the key is borrowed initially, we can return `&mut V` instead of
+    /// `GetOrInsertResult<K, V>`, as the key is not consumed.
+    ///
+    /// This is an `O(log n)` operation.
+    ///
+    /// # Example
+    /// ```rust
+    /// # use intrusive_lru_cache::LRUCache;
+    /// let mut lru = LRUCache::<String, String>::unbounded();
+    ///
+    /// // note that the key is just an `&str`
+    /// let v = lru.get_or_insert2("a", || "Hello".to_owned());
+    /// v.push_str(", World!");
+    ///
+    /// assert_eq!(lru.pop().unwrap(), ("a".to_owned(), "Hello, World!".to_owned()));
+    /// ```
+    pub fn get_or_insert2<Q, F>(&mut self, key: &Q, f: F) -> &mut V
+    where
+        K: Borrow<Q>,
+        Q: ToOwned<Owned = K> + Ord + ?Sized,
+        F: FnOnce() -> V,
+    {
+        match self.tree.entry(Borrowed::new(key)) {
+            // SAFETY: Cursor is a valid pointer here in both the tree and list
+            RBTreeEntry::Occupied(cursor) => unsafe {
+                bump(&mut self.list, cursor.get().unwrap_unchecked());
+            },
+            RBTreeEntry::Vacant(cursor) => {
+                let node = Node::new(key.to_owned(), f());
+
+                cursor.insert(node.clone());
+                self.list.push_front(node);
+
+                self.size += 1;
+                self.shrink();
+            }
+        }
+
+        // SAFETY: We have `&mut self` and the list is valid given the above logic
+        // the element we want was _just_ repositioned to the front
+        unsafe {
+            self.list
+                .front_mut()
+                .into_ref()
+                .unwrap_unchecked()
+                .value
+                .get_mut()
         }
     }
 
