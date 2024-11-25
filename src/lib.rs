@@ -15,8 +15,9 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::borrow::Borrow;
 use core::cell::UnsafeCell;
+use core::fmt;
 use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut, Index};
 use core::ptr::NonNull;
 
 use intrusive_collections::intrusive_adapter;
@@ -180,7 +181,38 @@ pub struct LRUCache<K, V> {
     max_capacity: usize,
 }
 
+impl<K, V> fmt::Debug for LRUCache<K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter_peek_ord()).finish()
+    }
+}
+
 impl<K, V> LRUCache<K, V> {
+    /// Defines the size of the internal node structure in bytes.
+    ///
+    /// The memory footprint of the entire cache can then be calculated as:
+    /// ```rust,ignore
+    /// LRUCache::<K, V>::NODE_SIZE * cache.len()
+    ///     + size_of::<LRUCache<K, V>>() // size of the cache itself
+    /// ```
+    /// or via [`memory_footprint`](Self::memory_footprint).
+    ///
+    /// This is a nice benefit of intrusive collections, as it allows for a single
+    /// allocation per key-value pair.
+    pub const NODE_SIZE: usize = size_of::<Node<K, V>>();
+
+    /// Returns the total bytes consumed by the cache, including
+    /// all allocations, internal structures, and the cache itself.
+    #[must_use]
+    #[inline]
+    pub const fn memory_footprint(&self) -> usize {
+        Self::NODE_SIZE * self.size + core::mem::size_of::<Self>()
+    }
+
     /// Creates a new unbounded LRU cache.
     ///
     /// This cache has no limit on the number of entries it can hold,
@@ -242,11 +274,7 @@ fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
     // SAFETY: Cursor created from a known valid pointer
     let node = unsafe { list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
 
-    // NOTE: Not a good idea to reuse the `front` cursor here, as it's potentially
-    // invalidated by the `remove` call above. Emphasis on potentially,
-    // as that might only happen if the cursor is at the front of the list,
-    // which we checked for, but it's better to be safe.
-    list.front_mut().insert_before(node);
+    list.push_front(node);
 }
 
 impl<K, V> LRUCache<K, V>
@@ -255,6 +283,8 @@ where
 {
     /// Returns a reference to the value corresponding to the key,
     /// without updating the LRU list.
+    ///
+    /// This is an `O(log n)` operation.
     pub fn peek<'a, Q>(&'a self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
@@ -266,8 +296,28 @@ where
             .map(|node| node.value.get())
     }
 
+    /// Returns a reference to the most recently used key-value pair,
+    /// without updating the LRU order further.
+    ///
+    /// This is an `O(1)` operation.
+    #[must_use]
+    pub fn peek_newest(&self) -> Option<(&K, &V)> {
+        self.list.front().get().map(|node| (&node.key, node.value.get()))
+    }
+
+    /// Returns a reference to the least recently used key-value pair,
+    /// without updating the LRU order further.
+    ///
+    /// This is an `O(1)` operation.
+    #[must_use]
+    pub fn peek_oldest(&self) -> Option<(&K, &V)> {
+        self.list.back().get().map(|node| (&node.key, node.value.get()))
+    }
+
     /// Returns a reference to the value corresponding to the key,
     /// and bumps the key to the front of the LRU list.
+    ///
+    /// This is an `O(log n)` operation.
     pub fn get<'a, Q>(&'a mut self, key: &Q) -> Option<&'a mut V>
     where
         K: Borrow<Q>,
@@ -281,6 +331,53 @@ where
         Some(unsafe { node.value.get_mut() })
     }
 
+    /// If the key is present in the cache, it is bumped to the
+    /// front of the LRU list as the most recently used. This
+    /// will cause it to be the last to be evicted.
+    ///
+    /// Has no effect if the key is not present.
+    ///
+    /// This is an `O(log n)` operation.
+    pub fn promote<Q>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if let Some(node) = self.tree.find(Borrowed::new(key)).get() {
+            bump(&mut self.list, node);
+        }
+    }
+
+    /// If the key is present in the cache, it is demoted to the
+    /// back of the LRU list as the least recently used. This
+    /// will cause it to be evicted first if the cache is full.
+    ///
+    /// Has no effect if the key is not present.
+    ///
+    /// This is an `O(log n)` operation.
+    pub fn demote<Q>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        if let Some(node) = self.tree.find(Borrowed::new(key)).get() {
+            // same logic as bump, but for the back, and only used here
+
+            // SAFETY: The list is guaranteed to be non-empty by virtue of `node` existing
+            let back = unsafe { self.list.back().get().unwrap_unchecked() };
+
+            // don't bother if it's already at the back
+            if core::ptr::eq(node, back) {
+                return;
+            }
+
+            // SAFETY: Cursor created from a known valid pointer
+            let node = unsafe { self.list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+
+            self.list.push_back(node);
+        }
+    }
+
     /// Returns a smart reference to the value corresponding to the key,
     /// allowing for reading and updating the LRU order at the same time,
     /// with or without updating the LRU order.
@@ -291,6 +388,8 @@ where
     ///
     /// Immutable access via [`SmartEntry::peek`] or [`SmartEntry::deref`]
     /// does not update the LRU order.
+    ///
+    /// This is an `O(log n)` operation.
     pub fn smart_get<'a, Q>(&'a mut self, key: &Q) -> Option<SmartEntry<'a, K, V>>
     where
         K: Borrow<Q>,
@@ -308,6 +407,8 @@ where
     /// of the keys in the tree via `Ord`.
     ///
     /// The range follows `[min, max)`, where `min` is inclusive and `max` is exclusive.
+    ///
+    /// This is an `O(log n)` operation, though the iterator itself is `O(1)` to increment.
     pub fn peek_range<'a, MIN, MAX>(
         &'a self,
         min: &MIN,
@@ -331,6 +432,8 @@ where
     /// on the order of the keys in the tree via `Ord`.
     ///
     /// The range follows `[min, max)`, where `min` is inclusive and `max` is exclusive.
+    ///
+    /// This is an `O(log n)` operation, though the iterator itself is `O(1)` to increment.
     pub fn range<'a, MIN, MAX>(
         &'a mut self,
         min: &MIN,
@@ -359,6 +462,8 @@ where
     /// which allows for reading and updating the LRU order at the same time, only
     /// bumping the LRU order when the value is accessed mutably via either [`SmartEntry::get`]
     /// or [`SmartEntry::deref_mut`].
+    ///
+    /// This is an `O(log n)` operation, though the iterator itself is `O(1)` to increment.
     pub fn smart_range<'a, MIN, MAX>(
         &'a mut self,
         min: &MIN,
@@ -387,6 +492,8 @@ where
     /// Inserts a key-value pair into the cache, replacing
     /// the existing value if the key was already present, and then
     /// returning it. In both cases, the entry is moved to the front of the LRU list.
+    ///
+    /// This is an `O(log n)` operation.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         match self.tree.entry(Borrowed::new(&key)) {
             // SAFETY: We treat the cursor as a mutable reference, and only use known valid pointers
@@ -417,9 +524,24 @@ where
         }
     }
 
+    /// Returns true if the cache contains the key.
+    ///
+    /// This does not update the LRU order.
+    ///
+    /// This is an `O(log n)` operation.
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        !self.tree.find(Borrowed::new(key)).is_null()
+    }
+
     /// Removes the value corresponding to the key from the cache,
     /// and returning it if it was present. This has no effect on the order
     /// of other entries in the LRU list.
+    ///
+    /// This is an `O(log n)` operation.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
@@ -438,11 +560,66 @@ where
         Some(value.into_inner())
     }
 
+    /// Attempts to get a mutable reference to the value corresponding to the key,
+    /// and if it's not present, inserts a new key-value pair with the value returned
+    /// by the provided closure. The entry is then moved to the front of the LRU list.
+    ///
+    /// This is similar to [`insert_or_get`](Self::insert_or_get), but for cases
+    /// where the value is likely to be found in the cache already.
+    ///
+    /// This is an `O(log n)` operation.
+    pub fn get_or_insert<F>(&mut self, key: K, f: F) -> GetOrInsertResult<K, V>
+    where
+        F: FnOnce() -> V,
+    {
+        let key = match self.tree.entry(Borrowed::new(&key)) {
+            // SAFETY: Cursor is a valid pointer here in both the tree and list
+            RBTreeEntry::Occupied(cursor) => unsafe {
+                bump(&mut self.list, cursor.get().unwrap_unchecked());
+
+                Some(key)
+            },
+            RBTreeEntry::Vacant(cursor) => {
+                let node = Node::new(key, f());
+
+                cursor.insert(node.clone());
+                self.list.push_front(node);
+
+                self.size += 1;
+
+                self.shrink();
+
+                None
+            }
+        };
+
+        // SAFETY: We have `&mut self` and the list is valid given the above logic
+        // the element we want was _just_ repositioned to the front
+        let v = unsafe {
+            self.list
+                .front_mut()
+                .into_ref()
+                .unwrap_unchecked()
+                .value
+                .get_mut()
+        };
+
+        match key {
+            Some(key) => GetOrInsertResult::Existed(v, key),
+            None => GetOrInsertResult::Inserted(v),
+        }
+    }
+
     /// Inserts a key-value pair into the cache only if it wasn't already present,
     /// otherwise update the LRU order for this element and return a reference to the value.
     ///
     /// The returned value contains a mutable reference to the value, and if the key already existed,
     /// it also contains the key and value that were passed in.
+    ///
+    /// This is similar to [`get_or_insert`](Self::get_or_insert), but for cases
+    /// where insertion is expected.
+    ///
+    /// This is an `O(log n)` operation.
     pub fn insert_or_get(&mut self, key: K, value: V) -> InsertOrGetResult<'_, K, V> {
         let kv = match self.tree.entry(Borrowed::new(&key)) {
             // SAFETY: Cursor is a valid pointer here in both the tree and list
@@ -485,6 +662,20 @@ where
     }
 }
 
+/// The result of [`LRUCache::get_or_insert`](LRUCache::get_or_insert).
+///
+/// If inserted, it returns a reference to the newly inserted value.
+/// If the key already existed, it returns a reference to the existing value, and the provided key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GetOrInsertResult<'a, K, V> {
+    /// Element was inserted, key and value were consumed.
+    Inserted(&'a mut V),
+
+    /// Element already existed at the given key, so a reference
+    /// to the existing value is returned, along with the given key.
+    Existed(&'a mut V, K),
+}
+
 /// The result of [`LRUCache::insert_or_get`](LRUCache::insert_or_get).
 ///
 /// If inserted, it returns a reference to the newly inserted value.
@@ -499,6 +690,19 @@ pub enum InsertOrGetResult<'a, K, V> {
     Existed(&'a mut V, K, V),
 }
 
+impl<'a, K, V> GetOrInsertResult<'a, K, V> {
+    /// Consumes the result and returns a reference to the value.
+    ///
+    /// This will drop the key if it existed.
+    #[inline(always)]
+    pub fn into_inner(self) -> &'a mut V {
+        match self {
+            Self::Inserted(value) => value,
+            Self::Existed(value, _) => value,
+        }
+    }
+}
+
 impl<'a, K, V> InsertOrGetResult<'a, K, V> {
     /// Consumes the result and returns a reference to the value.
     ///
@@ -508,6 +712,18 @@ impl<'a, K, V> InsertOrGetResult<'a, K, V> {
         match self {
             Self::Inserted(value) => value,
             Self::Existed(value, _, _) => value,
+        }
+    }
+}
+
+impl<K, V> Deref for GetOrInsertResult<'_, K, V> {
+    type Target = V;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Inserted(value) => value,
+            Self::Existed(value, _) => value,
         }
     }
 }
@@ -524,6 +740,16 @@ impl<K, V> Deref for InsertOrGetResult<'_, K, V> {
     }
 }
 
+impl<K, V> DerefMut for GetOrInsertResult<'_, K, V> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Inserted(value) => value,
+            Self::Existed(value, _) => value,
+        }
+    }
+}
+
 impl<K, V> DerefMut for InsertOrGetResult<'_, K, V> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -531,6 +757,61 @@ impl<K, V> DerefMut for InsertOrGetResult<'_, K, V> {
             Self::Inserted(value) => value,
             Self::Existed(value, _, _) => value,
         }
+    }
+}
+
+impl<K, V> LRUCache<K, V> {
+    /// Removes and returns the least recently used key-value pair.
+    ///
+    /// This is an `O(1)` operation.
+    pub fn pop(&mut self) -> Option<(K, V)> {
+        let node = self.list.pop_back()?;
+
+        // SAFETY: Cursor created from a known valid pointer
+        let _ = unsafe { self.tree.cursor_mut_from_ptr(&*node).remove().unwrap_unchecked() };
+
+        self.size -= 1;
+
+        // SAFETY: node is removed from both the tree and list
+        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
+
+        Some((key, value.into_inner()))
+    }
+
+    // TODO: Add a pop_while function that takes a filter callback and returns an iterator
+
+    /// Removes and returns the highest `Ord` key-value pair.
+    ///
+    /// This is an `O(1)` operation.
+    pub fn pop_highest(&mut self) -> Option<(K, V)> {
+        let node = self.tree.back_mut().remove()?;
+
+        // SAFETY: Cursor created from a known valid pointer
+        let _ = unsafe { self.list.cursor_mut_from_ptr(&*node).remove().unwrap_unchecked() };
+
+        self.size -= 1;
+
+        // SAFETY: node is removed from both the tree and list
+        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
+
+        Some((key, value.into_inner()))
+    }
+
+    /// Removes and returns the lowest `Ord` key-value pair.
+    ///
+    /// This is an `O(1)` operation.
+    pub fn pop_lowest(&mut self) -> Option<(K, V)> {
+        let node = self.tree.front_mut().remove()?;
+
+        // SAFETY: Cursor created from a known valid pointer
+        let _ = unsafe { self.list.cursor_mut_from_ptr(&*node).remove().unwrap_unchecked() };
+
+        self.size -= 1;
+
+        // SAFETY: node is removed from both the tree and list
+        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
+
+        Some((key, value.into_inner()))
     }
 }
 
@@ -545,6 +826,24 @@ impl<K, V> LRUCache<K, V> {
     #[inline(always)]
     pub fn set_max_capacity(&mut self, max_capacity: usize) {
         self.max_capacity = max_capacity;
+    }
+
+    /// Returns the maximum capacity of the cache, which is the
+    /// point at which the cache will start evicting older entries.
+    #[inline(always)]
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.max_capacity
+    }
+
+    /// Sets the maximum capacity of the cache, and removes the oldest entries
+    /// until the length is less than or equal to the new capacity.
+    ///
+    /// If the new capacity is greater than the current length, no entries are removed.
+    #[inline]
+    pub fn resize(&mut self, max_capacity: usize) {
+        self.set_max_capacity(max_capacity);
+        self.shrink();
     }
 
     /// Clears the cache, removing all key-value pairs.
@@ -641,21 +940,23 @@ impl<K, V> LRUCache<K, V> {
         self.size == 0
     }
 
-    /// Removes and returns the least recently used key-value pair.
+    /// Returns `true` if the cache is full.
     ///
-    /// This is an `O(1)` operation.
-    pub fn pop(&mut self) -> Option<(K, V)> {
-        let node = self.list.pop_back()?;
+    /// Attempting to insert a new key-value pair will cause the cache to evict at least
+    /// one entry to make room for the new one.
+    #[inline(always)]
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.size >= self.max_capacity
+    }
 
-        // SAFETY: Cursor created from a known valid pointer
-        let _ = unsafe { self.tree.cursor_mut_from_ptr(&*node).remove().unwrap_unchecked() };
-
-        self.size -= 1;
-
-        // SAFETY: node is removed from both the tree and list
-        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
-
-        Some((key, value.into_inner()))
+    /// Returns an iterator over the keys in the cache,
+    /// in order of key `Ord` order.
+    ///
+    /// NOTE: This does _not_ update the LRU order.
+    #[must_use]
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> {
+        self.tree.iter().map(|node| &node.key)
     }
 
     /// Returns an iterator over immutable key-value pairs in the cache,
@@ -686,6 +987,38 @@ impl<K, V> LRUCache<K, V> {
             list,
             _marker: PhantomData,
         })
+    }
+
+    /// Iterates over all key-value pairs in the cache, and calls the provided closure
+    /// to determine if the key-value pair should be retained. If the closure returns `false`,
+    /// the key-value pair is removed from the cache.
+    ///
+    /// LRU Order is unchanged.
+    ///
+    /// This is an `O(n)` operation.
+    pub fn retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        let mut cursor = self.tree.front_mut();
+
+        while let Some(node) = cursor.get() {
+            if predicate(&node.key, node.value.get()) {
+                cursor.move_next();
+                continue;
+            }
+
+            // SAFETY: Cursor created from a known valid node
+            unsafe { self.list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+
+            // SAFETY: We were just using the node, but now we own it
+            let node = unsafe { cursor.remove().unwrap_unchecked() };
+
+            self.size -= 1;
+
+            // SAFETY: node is removed from both the tree and list
+            let _ = unsafe { UnsafeRef::into_box(node) };
+        }
     }
 }
 
@@ -769,6 +1102,25 @@ impl<K, V> Drop for LRUCache<K, V> {
     }
 }
 
+impl<K, V, Q> Index<&Q> for LRUCache<K, V>
+where
+    K: Borrow<Q> + Ord + 'static,
+    Q: Ord + ?Sized,
+{
+    type Output = V;
+
+    /// Returns a reference to the value corresponding to the key,
+    /// without updating the LRU order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key is not present in the cache.
+    #[inline]
+    fn index(&self, index: &Q) -> &Self::Output {
+        self.peek(index).expect("no entry found for key")
+    }
+}
+
 impl<K, V> Extend<(K, V)> for LRUCache<K, V>
 where
     K: Ord + 'static,
@@ -810,6 +1162,7 @@ where
     type Item = (K, V);
     type IntoIter = IntoIter<K, V>;
 
+    #[inline]
     fn into_iter(mut self) -> Self::IntoIter {
         self.tree.fast_clear();
 
@@ -823,6 +1176,7 @@ where
 impl<K, V> Iterator for IntoIter<K, V> {
     type Item = (K, V);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.list.pop_front()?;
 
@@ -834,6 +1188,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
 }
 
 impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
+    #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         let node = self.list.pop_back()?;
 
