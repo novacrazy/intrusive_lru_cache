@@ -938,12 +938,10 @@ impl<K, V> LRUCache<K, V> {
     pub fn clear(&mut self) {
         self.tree.fast_clear();
 
-        let mut front = self.list.front_mut();
-
-        while let Some(node) = front.remove() {
-            // SAFETY: node is removed from both the tree and list
-            let _ = unsafe { UnsafeRef::into_box(node) };
-        }
+        self.list.clear_with(|node| {
+            // SAFETY: Node is removed from both the tree and list
+            let _ = unsafe { Node::unwrap(node) };
+        });
     }
 
     /// Removes the oldest entries from the cache until the length is less than or equal to the maximum capacity.
@@ -1303,11 +1301,9 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
 impl<K, V> Drop for IntoIter<K, V> {
     #[inline]
     fn drop(&mut self) {
-        let mut front = self.list.front_mut();
-
-        while let Some(node) = front.remove() {
-            // SAFETY: node is removed from both the tree and list
-            let _ = unsafe { UnsafeRef::into_box(node) };
-        }
+        self.list.clear_with(|node| {
+            // SAFETY: Node is removed from the list
+            let _ = unsafe { Node::unwrap(node) };
+        });
     }
 }

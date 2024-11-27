@@ -12,9 +12,17 @@ include = ["src/**/*", "LICENSE-*", "README.md"]
 repository = "https://github.com/novacrazy/intrusive_lru_cache"
 documentation = "https://docs.rs/intrusive-lru-cache"
 
+[patch.crates-io]
+intrusive-collections = { git = "https://github.com/novacrazy/intrusive-rs" }
+
 [dependencies]
 intrusive-collections = "0.9.7"
 
 [features]
 default = ["atomic"]
 atomic = []
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
