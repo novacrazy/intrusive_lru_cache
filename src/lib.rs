@@ -32,6 +32,8 @@ use intrusive_collections::{LinkedListAtomicLink as LinkedListLink, RBTreeAtomic
 #[cfg(not(feature = "atomic"))]
 use intrusive_collections::{LinkedListLink, RBTreeLink};
 
+// intrusive-collections does not provide a way to mutably access the value
+// in a node, so we need to use `UnsafeCell` to allow for interior mutability.
 #[repr(transparent)]
 struct Value<V>(UnsafeCell<V>);
 
@@ -42,7 +44,7 @@ impl<V> Value<V> {
     }
 
     #[inline(always)]
-    fn get(&self) -> &V {
+    const fn get(&self) -> &V {
         // SAFETY: Read-only access to value is safe in conjunction with
         // the guarantees of other methods.
         unsafe { &*self.0.get() }
@@ -51,13 +53,13 @@ impl<V> Value<V> {
     // SAFETY: Only use with exclusive access to the Node
     #[allow(clippy::mut_from_ref)]
     #[inline(always)]
-    unsafe fn get_mut(&self) -> &mut V {
+    const unsafe fn get_mut(&self) -> &mut V {
         &mut *self.0.get()
     }
 
     /// SAFETY: Only use with exclusive access to the Node
     #[inline(always)]
-    unsafe fn replace(&self, value: V) -> V {
+    const unsafe fn replace(&self, value: V) -> V {
         core::ptr::replace(self.0.get(), value)
     }
 
@@ -91,6 +93,17 @@ impl<K, V> Node<K, V> {
             key,
             value: Value::new(value),
         }))
+    }
+
+    /// Assumes the node is not in any collections, and extracts the key/value
+    /// when deallocating it.
+    ///
+    /// SAFETY: Only use after ensuring the node is not in any collections
+    #[inline(always)]
+    unsafe fn unwrap(this: UnsafeRef<Self>) -> (K, V) {
+        let Node { key, value, .. } = *UnsafeRef::into_box(this);
+
+        (key, value.into_inner())
     }
 }
 
@@ -153,6 +166,11 @@ impl<'a, K: 'a, V> KeyAdapter<'a> for NodeTreeAdapter<K, V> {
 /// based on how the value is accessed. The `get` method always updates the LRU order,
 /// and the `peek_*` methods allow for reading without updating the LRU order.
 ///
+/// An overarching principle here is that the 'Used' in Lease-Recently-Used
+/// is defined by the mutable access to the value. This allows for a more flexible
+/// API, where the LRU order can be updated only when necessary, and not on every
+/// read access.
+///
 /// # Example
 /// ```rust
 /// use intrusive_lru_cache::LRUCache;
@@ -171,7 +189,7 @@ impl<'a, K: 'a, V> KeyAdapter<'a> for NodeTreeAdapter<K, V> {
 /// assert_eq!(lru.pop(), None);
 /// ```
 ///
-/// NOTES:
+/// # Notes
 /// - Cloning preserves LRU order.
 /// - If the `atomic` crate feature is enabled,
 ///     the cache is thread-safe if `K` and `V` are `Send`/`Sync`.
@@ -212,7 +230,7 @@ impl<K, V> LRUCache<K, V> {
     #[must_use]
     #[inline]
     pub const fn memory_footprint(&self) -> usize {
-        Self::NODE_SIZE * self.size + core::mem::size_of::<Self>()
+        Self::NODE_SIZE * self.size + size_of::<Self>()
     }
 
     /// Creates a new unbounded LRU cache.
@@ -303,6 +321,7 @@ where
     ///
     /// This is an `O(1)` operation.
     #[must_use]
+    #[inline]
     pub fn peek_newest(&self) -> Option<(&K, &V)> {
         self.list.front().get().map(|node| (&node.key, node.value.get()))
     }
@@ -312,8 +331,32 @@ where
     ///
     /// This is an `O(1)` operation.
     #[must_use]
+    #[inline]
     pub fn peek_oldest(&self) -> Option<(&K, &V)> {
         self.list.back().get().map(|node| (&node.key, node.value.get()))
+    }
+
+    /// Returns a reference to the most recently used key-value pair.
+    ///
+    /// Because this is already the most recently used, it's free to be accessed without
+    /// any additional cost or additional modification of the LRU order.
+    ///
+    /// This is an `O(1)` operation.
+    #[inline]
+    pub fn get_newest(&mut self) -> Option<(&K, &mut V)> {
+        self.list
+            .front_mut()
+            .into_ref()
+            // SAFETY: We have `&mut self`
+            .map(|node| unsafe { (&node.key, node.value.get_mut()) })
+    }
+
+    // SAFETY: The caller must guarantee that the cache is non-empty
+    #[inline(always)]
+    unsafe fn get_newest_unchecked(&mut self) -> (&K, &mut V) {
+        let node = self.list.front_mut().into_ref().unwrap_unchecked();
+
+        (&node.key, node.value.get_mut())
     }
 
     /// Returns a reference to the value corresponding to the key,
@@ -381,8 +424,8 @@ where
     }
 
     /// Returns a smart reference to the value corresponding to the key,
-    /// allowing for reading and updating the LRU order at the same time,
-    /// with or without updating the LRU order.
+    /// allowing for reading and updating at the same time,
+    /// only updating the LRU on mutable access.
     ///
     /// This does not immediately update the LRU order; only
     /// when the value is accessed via [`SmartEntry::get`] or
@@ -400,6 +443,25 @@ where
         Some(SmartEntry {
             node: self.tree.find(Borrowed::new(key)).get()?,
             list: NonNull::from(&mut self.list),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Returns a smart reference to the least recently used key-value pair,
+    /// allowing for reading and updating at the same time,
+    /// only updating the LRU on mutable access.
+    ///
+    /// This does not immediately update the LRU order; only
+    /// when the value is accessed via [`SmartEntry::get`] or
+    /// [`SmartEntry::deref_mut`].
+    ///
+    /// This is an `O(1)` operation.
+    pub fn smart_get_oldest(&mut self) -> Option<SmartEntry<'_, K, V>> {
+        let list = NonNull::from(&mut self.list);
+
+        Some(SmartEntry {
+            node: self.list.back_mut().into_ref()?,
+            list,
             _marker: PhantomData,
         })
     }
@@ -556,9 +618,7 @@ where
         self.size -= 1;
 
         // SAFETY: node is removed from both the tree and list
-        let Node { value, .. } = unsafe { *UnsafeRef::into_box(node) };
-
-        Some(value.into_inner())
+        Some(unsafe { Node::unwrap(node).1 })
     }
 
     /// Attempts to get a mutable reference to the value corresponding to the key,
@@ -597,14 +657,7 @@ where
 
         // SAFETY: We have `&mut self` and the list is valid given the above logic
         // the element we want was _just_ repositioned to the front
-        let v = unsafe {
-            self.list
-                .front_mut()
-                .into_ref()
-                .unwrap_unchecked()
-                .value
-                .get_mut()
-        };
+        let v = unsafe { self.get_newest_unchecked().1 };
 
         match key {
             Some(key) => GetOrInsertResult::Existed(v, key),
@@ -655,14 +708,7 @@ where
 
         // SAFETY: We have `&mut self` and the list is valid given the above logic
         // the element we want was _just_ repositioned to the front
-        unsafe {
-            self.list
-                .front_mut()
-                .into_ref()
-                .unwrap_unchecked()
-                .value
-                .get_mut()
-        }
+        unsafe { self.get_newest_unchecked().1 }
     }
 
     /// Inserts a key-value pair into the cache only if it wasn't already present,
@@ -701,14 +747,7 @@ where
 
         // SAFETY: We have `&mut self` and the list is valid given the above logic
         // the element we want was _just_ repositioned to the front
-        let v = unsafe {
-            self.list
-                .front_mut()
-                .into_ref()
-                .unwrap_unchecked()
-                .value
-                .get_mut()
-        };
+        let v = unsafe { self.get_newest_unchecked().1 };
 
         match kv {
             Some((key, value)) => InsertOrGetResult::Existed(v, key, value),
@@ -828,9 +867,7 @@ impl<K, V> LRUCache<K, V> {
         self.size -= 1;
 
         // SAFETY: node is removed from both the tree and list
-        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
-
-        Some((key, value.into_inner()))
+        Some(unsafe { Node::unwrap(node) })
     }
 
     // TODO: Add a pop_while function that takes a filter callback and returns an iterator
@@ -847,9 +884,7 @@ impl<K, V> LRUCache<K, V> {
         self.size -= 1;
 
         // SAFETY: node is removed from both the tree and list
-        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
-
-        Some((key, value.into_inner()))
+        Some(unsafe { Node::unwrap(node) })
     }
 
     /// Removes and returns the lowest `Ord` key-value pair.
@@ -864,9 +899,7 @@ impl<K, V> LRUCache<K, V> {
         self.size -= 1;
 
         // SAFETY: node is removed from both the tree and list
-        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
-
-        Some((key, value.into_inner()))
+        Some(unsafe { Node::unwrap(node) })
     }
 }
 
@@ -1032,8 +1065,13 @@ impl<K, V> LRUCache<K, V> {
         self.tree.iter().map(|node| (&node.key, node.value.get()))
     }
 
-    /// Returns an iterator over mutable key-value pairs in the cache,
-    /// in the order determined by the `Ord` implementation of the keys.
+    /// Returns an iterator yielding key-value pairs in the cache as [`SmartEntry`],
+    /// in the order determined by the `Ord` implementation of the keys. This allows for
+    /// reading and updating the LRU order at the same time, only updating the LRU order
+    /// when the value is accessed mutably.
+    ///
+    /// Entries yielded do not immediately update the LRU order; only when the value is accessed
+    /// via [`SmartEntry::get`] or [`SmartEntry::deref_mut`].
     pub fn smart_iter(&mut self) -> impl DoubleEndedIterator<Item = SmartEntry<'_, K, V>> {
         let list = NonNull::from(&mut self.list);
 
@@ -1102,7 +1140,7 @@ impl<K, V> Deref for SmartEntry<'_, K, V> {
     /// Dereferences the value, without updating the LRU order.
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        self.peek().1
+        self.peek_value()
     }
 }
 
@@ -1110,7 +1148,7 @@ impl<K, V> DerefMut for SmartEntry<'_, K, V> {
     /// Mutably dereferences the value, and updates the LRU order.
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.get().1
+        self.get_value()
     }
 }
 
@@ -1122,22 +1160,26 @@ impl<K, V> SmartEntry<'_, K, V> {
         &self.node.key
     }
 
-    /// Access the key-value pair, without updating the LRU order.
-    ///
-    /// The `Deref` implementation invokes this method to access the value.
+    /// Access the key-value pair immutably, without updating the LRU order.
     #[inline(always)]
     #[must_use]
     pub fn peek(&self) -> (&K, &V) {
         (&self.node.key, self.node.value.get())
     }
 
+    /// Access the value immutably, without updating the LRU order.
+    ///
+    /// This is the same as [`SmartEntry::deref`].
+    #[inline(always)]
+    #[must_use]
+    pub fn peek_value(&self) -> &V {
+        self.node.value.get()
+    }
+
     /// Access the key-value pair, and update the LRU order.
     ///
     /// The LRU order is updated every time this method is called,
     /// as it is assumed that the caller is actively using the value.
-    ///
-    /// The `DerefMut` implementation invokes this method to access the value,
-    /// updating the LRU order in the process.
     #[must_use]
     pub fn get(&mut self) -> (&K, &mut V) {
         // SAFETY: We tied the lifetime of the pointer to 'a, the same as the LRUCache,
@@ -1149,9 +1191,22 @@ impl<K, V> SmartEntry<'_, K, V> {
         // SAFETY: We have exclusive access to the Node
         unsafe { (&self.node.key, self.node.value.get_mut()) }
     }
+
+    /// Access the value mutably, and update the LRU order.
+    ///
+    /// This LRU order is updated every time this method is called,
+    /// as it is assumed that the caller is actively using the value.
+    ///
+    /// The `DerefMut` implementation invokes this method to access the value,
+    /// updating the LRU order in the process.
+    #[inline(always)]
+    pub fn get_value(&mut self) -> &mut V {
+        self.get().1
+    }
 }
 
 impl<K, V> Drop for LRUCache<K, V> {
+    #[inline]
     fn drop(&mut self) {
         self.clear();
     }
@@ -1222,8 +1277,7 @@ where
         self.tree.fast_clear();
 
         IntoIter {
-            // swap out the list to avoid double drop
-            list: core::mem::replace(&mut self.list, LinkedList::new(NodeListAdapter::new())),
+            list: self.list.take(),
         }
     }
 }
@@ -1233,23 +1287,27 @@ impl<K, V> Iterator for IntoIter<K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let node = self.list.pop_front()?;
-
-        // SAFETY: node is removed from both the tree and list
-        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
-
-        Some((key, value.into_inner()))
+        // SAFETY: node is removed from the list
+        self.list.pop_front().map(|node| unsafe { Node::unwrap(node) })
     }
 }
 
 impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        let node = self.list.pop_back()?;
+        // SAFETY: node is removed from the list
+        self.list.pop_back().map(|node| unsafe { Node::unwrap(node) })
+    }
+}
 
-        // SAFETY: node is removed from both the tree and list
-        let Node { key, value, .. } = unsafe { *UnsafeRef::into_box(node) };
+impl<K, V> Drop for IntoIter<K, V> {
+    #[inline]
+    fn drop(&mut self) {
+        let mut front = self.list.front_mut();
 
-        Some((key, value.into_inner()))
+        while let Some(node) = front.remove() {
+            // SAFETY: node is removed from both the tree and list
+            let _ = unsafe { UnsafeRef::into_box(node) };
+        }
     }
 }

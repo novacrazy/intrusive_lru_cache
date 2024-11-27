@@ -75,3 +75,15 @@ fn test_retain() {
     assert_eq!(lru.pop(), Some(("b", "2")));
     assert_eq!(lru.pop(), None);
 }
+
+#[test]
+fn test_get_or_insert2() {
+    let mut lru = LRUCache::<String, String>::unbounded();
+
+    let mut test = false;
+
+    let _ = lru.get_or_insert2("test", || {
+        test = true;
+        String::from("test")
+    });
+}
