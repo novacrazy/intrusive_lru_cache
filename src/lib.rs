@@ -282,6 +282,7 @@ where
 }
 
 /// Bumps a node to the front of the list, only if it's not already there.
+#[inline]
 fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
     // SAFETY: The list is guaranteed to be non-empty  by virtue of `node` existing
     let front = unsafe { list.front().get().unwrap_unchecked() };
@@ -295,6 +296,26 @@ fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
     let node = unsafe { list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
 
     list.push_front(node);
+}
+
+/// Drops every element in the list, trying to be as efficient as possible.
+///
+/// Using front.remove() in a loop reconnects the linked list links, which is unnecessary.
+#[inline]
+fn drop_list<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>) {
+    let mut front = list.front();
+
+    // drop pointer as we iterate through the list, only after we've passed it
+    while let Some(ptr) = front.clone_pointer() {
+        front.move_next();
+
+        // SAFETY: While the node is technically not removed
+        // from the list, it's not accessible anymore after move_next
+        let _ = unsafe { Node::unwrap(ptr) };
+    }
+
+    // ensure LinkedList::drop does nothing
+    list.fast_clear();
 }
 
 impl<K, V> LRUCache<K, V>
@@ -938,12 +959,7 @@ impl<K, V> LRUCache<K, V> {
     pub fn clear(&mut self) {
         self.tree.fast_clear();
 
-        let mut front = self.list.front_mut();
-
-        while let Some(node) = front.remove() {
-            // SAFETY: node is removed from both the tree and list
-            let _ = unsafe { UnsafeRef::into_box(node) };
-        }
+        drop_list(&mut self.list);
     }
 
     /// Removes the oldest entries from the cache until the length is less than or equal to the maximum capacity.
@@ -1303,11 +1319,6 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
 impl<K, V> Drop for IntoIter<K, V> {
     #[inline]
     fn drop(&mut self) {
-        let mut front = self.list.front_mut();
-
-        while let Some(node) = front.remove() {
-            // SAFETY: node is removed from both the tree and list
-            let _ = unsafe { UnsafeRef::into_box(node) };
-        }
+        drop_list(&mut self.list);
     }
 }
