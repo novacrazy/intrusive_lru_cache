@@ -39,6 +39,16 @@ fn test_lru_cache() {
     // but that would require borrowing from the iterator, which is not possible
     drop(iter);
     drop(a);
+
+    //for x in lru.smart_iter() {
+    //    _ = x.remove();
+    //}
+
+    //let mut lru = make_lru();
+    // let mut iter = lru.smart_iter();
+    //_ = iter.next().unwrap().remove();
+    //_ = iter.next_back().unwrap().remove();
+    //_ = iter.next_back().unwrap().remove();
 }
 
 #[test]
@@ -86,4 +96,6 @@ fn test_get_or_insert2() {
         test = true;
         String::from("test")
     });
+
+    _ = lru.smart_get("test").unwrap().remove();
 }

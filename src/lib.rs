@@ -24,7 +24,19 @@ use core::ptr::NonNull;
 
 use intrusive_collections::intrusive_adapter;
 use intrusive_collections::rbtree::Entry as RBTreeEntry;
-use intrusive_collections::{Bound, KeyAdapter, LinkedList, RBTree, UnsafeRef};
+use intrusive_collections::{KeyAdapter, LinkedList, RBTree, UnsafeRef};
+
+pub use intrusive_collections::Bound;
+
+/// Utility function to convert a `Bound<&Q>` to `Bound<&Borrowed<Q>>`.
+#[inline(always)]
+const fn borrowed_bound<Q: ?Sized>(key: Bound<&Q>) -> Bound<&Borrowed<Q>> {
+    match key {
+        Bound::Included(key) => Bound::Included(Borrowed::new(key)),
+        Bound::Excluded(key) => Bound::Excluded(Borrowed::new(key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
 
 #[cfg(feature = "atomic")]
 use intrusive_collections::{LinkedListAtomicLink as LinkedListLink, RBTreeAtomicLink as RBTreeLink};
@@ -255,6 +267,12 @@ impl<K, V> LRUCache<K, V> {
             max_capacity,
         }
     }
+
+    #[inline(always)]
+    const fn get_ptr(&mut self) -> NonNull<Self> {
+        // SAFETY: Taking pointers from references is always guaranteed to be non-null
+        unsafe { NonNull::new_unchecked(&mut *self) }
+    }
 }
 
 impl<K, V> Default for LRUCache<K, V> {
@@ -302,7 +320,7 @@ fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
 ///
 /// Using front.remove() in a loop reconnects the linked list links, which is unnecessary.
 #[inline]
-fn drop_list<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>) {
+fn clear_list<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>) {
     let mut front = list.front();
 
     // drop pointer as we iterate through the list, only after we've passed it
@@ -461,11 +479,10 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        Some(SmartEntry {
-            node: self.tree.find(Borrowed::new(key)).get()?,
-            list: NonNull::from(&mut self.list),
-            _marker: PhantomData,
-        })
+        Some(SmartEntry::new(
+            self.get_ptr(),
+            self.tree.find(Borrowed::new(key)).get()?,
+        ))
     }
 
     /// Returns a smart reference to the least recently used key-value pair,
@@ -478,13 +495,7 @@ where
     ///
     /// This is an `O(1)` operation.
     pub fn smart_get_oldest(&mut self) -> Option<SmartEntry<'_, K, V>> {
-        let list = NonNull::from(&mut self.list);
-
-        Some(SmartEntry {
-            node: self.list.back_mut().into_ref()?,
-            list,
-            _marker: PhantomData,
-        })
+        Some(SmartEntry::new(self.get_ptr(), self.list.back_mut().into_ref()?))
     }
 
     /// Returns an iterator over the key-value pairs in the cache described by the range,
@@ -559,19 +570,55 @@ where
         MIN: Ord + ?Sized,
         MAX: Ord + ?Sized,
     {
-        let LRUCache { tree, .. } = self;
+        let cache = self.get_ptr();
 
-        let list = NonNull::from(&mut self.list);
+        let LRUCache { tree, .. } = self;
 
         tree.range(
             Bound::Included(Borrowed::new(min)),
             Bound::Excluded(Borrowed::new(max)),
         )
-        .map(move |node| SmartEntry {
-            node,
-            list,
-            _marker: PhantomData,
-        })
+        .map(move |node| SmartEntry::new(cache, node))
+    }
+
+    /// Returns a [`SmartEntry`] to the last key-value pair whose key is below
+    /// the given bound. This allows for reading and updating the LRU order
+    /// at the same time, only bumping the LRU order when the value is accessed
+    /// mutably via either [`SmartEntry::get`] or [`SmartEntry::deref_mut`].
+    ///
+    /// This is an `O(log n)` operation.
+    ///
+    /// Only a "smart" version of this method is provided, as neither the key or value are
+    /// exactly known, and the complexity warrants a complete solution.
+    pub fn smart_upper_bound<'a, Q>(&'a mut self, key: Bound<&Q>) -> Option<SmartEntry<'a, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        Some(SmartEntry::new(
+            self.get_ptr(),
+            self.tree.upper_bound(borrowed_bound(key)).get()?,
+        ))
+    }
+
+    /// Returns a [`SmartEntry`] to the first key-value pair whose key is above
+    /// the given bound. This allows for reading and updating the LRU order
+    /// at the same time, only bumping the LRU order when the value is accessed
+    /// mutably via either [`SmartEntry::get`] or [`SmartEntry::deref_mut`].
+    ///
+    /// This is an `O(log n)` operation.
+    ///
+    /// Only a "smart" version of this method is provided, as neither the key or value are
+    /// exactly known, and the complexity warrants a complete solution.
+    pub fn smart_lower_bound<'a, Q>(&'a mut self, key: Bound<&Q>) -> Option<SmartEntry<'a, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        Some(SmartEntry::new(
+            self.get_ptr(),
+            self.tree.lower_bound(borrowed_bound(key)).get()?,
+        ))
     }
 
     /// Inserts a key-value pair into the cache, replacing
@@ -959,7 +1006,7 @@ impl<K, V> LRUCache<K, V> {
     pub fn clear(&mut self) {
         self.tree.fast_clear();
 
-        drop_list(&mut self.list);
+        clear_list(&mut self.list);
     }
 
     /// Removes the oldest entries from the cache until the length is less than or equal to the maximum capacity.
@@ -1088,14 +1135,13 @@ impl<K, V> LRUCache<K, V> {
     ///
     /// Entries yielded do not immediately update the LRU order; only when the value is accessed
     /// via [`SmartEntry::get`] or [`SmartEntry::deref_mut`].
-    pub fn smart_iter(&mut self) -> impl DoubleEndedIterator<Item = SmartEntry<'_, K, V>> {
-        let list = NonNull::from(&mut self.list);
+    ///
+    /// Note that [`SmartEntry`] instances yielded by this iterator do not support [`SmartEntry::remove`]. It's
+    /// likely undefined behavior to remove entries while iterating over them, so we prevent that.
+    pub fn smart_iter(&mut self) -> impl DoubleEndedIterator<Item = SmartEntry<'_, K, V, sealed::NoRemove>> {
+        let cache = self.get_ptr();
 
-        self.tree.iter().map(move |node| SmartEntry {
-            node,
-            list,
-            _marker: PhantomData,
-        })
+        self.tree.iter().map(move |node| SmartEntry::new(cache, node))
     }
 
     /// Iterates over all key-value pairs in the cache, and calls the provided closure
@@ -1131,6 +1177,11 @@ impl<K, V> LRUCache<K, V> {
     }
 }
 
+mod sealed {
+    pub struct NoRemove;
+    pub struct CanRemove;
+}
+
 /// An entry in the cache that can be used for for reading or writing,
 /// only updating the LRU order when the value is accessed mutably.
 ///
@@ -1140,17 +1191,15 @@ impl<K, V> LRUCache<K, V> {
 ///
 /// See [`SmartEntry::peek`] and [`SmartEntry::get`] for more information.
 #[must_use]
-pub struct SmartEntry<'a, K, V> {
+pub struct SmartEntry<'a, K, V, R = sealed::CanRemove> {
+    // NOTE: This reference is valid so long as the `UnsafeRef` that holds it is allocated
     node: &'a Node<K, V>,
-
-    /// Since `Iterator` can't return a reference to self, we need to store the list
-    /// as a pointer to be able to update the LRU order. For all intents and purposes,
-    /// this pointer is equivalent to `&mut LinkedList<EntryListAdapter<K, V>>`.
-    list: NonNull<LinkedList<NodeListAdapter<K, V>>>,
-    _marker: core::marker::PhantomData<&'a mut LinkedList<NodeListAdapter<K, V>>>,
+    cache: NonNull<LRUCache<K, V>>,
+    _marker: core::marker::PhantomData<&'a mut LRUCache<K, V>>,
+    _removal: core::marker::PhantomData<R>,
 }
 
-impl<K, V> Deref for SmartEntry<'_, K, V> {
+impl<K, V, R> Deref for SmartEntry<'_, K, V, R> {
     type Target = V;
 
     /// Dereferences the value, without updating the LRU order.
@@ -1160,7 +1209,7 @@ impl<K, V> Deref for SmartEntry<'_, K, V> {
     }
 }
 
-impl<K, V> DerefMut for SmartEntry<'_, K, V> {
+impl<K, V, R> DerefMut for SmartEntry<'_, K, V, R> {
     /// Mutably dereferences the value, and updates the LRU order.
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -1168,7 +1217,27 @@ impl<K, V> DerefMut for SmartEntry<'_, K, V> {
     }
 }
 
-impl<K, V> SmartEntry<'_, K, V> {
+impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
+    #[inline(always)]
+    const fn new(cache: NonNull<LRUCache<K, V>>, node: &'a Node<K, V>) -> Self {
+        Self {
+            node,
+            cache,
+            _marker: PhantomData,
+            _removal: PhantomData,
+        }
+    }
+}
+
+impl<K, V, R> SmartEntry<'_, K, V, R> {
+    fn bump(&mut self) {
+        // SAFETY: We tied the lifetime of the pointer to 'a, the same as the LRUCache,
+        // so it will always be valid here. Furthermore, because it's a raw pointer,
+        // SmartEntry is not Send/Sync, so as long as the mutability happens right
+        // here and now, it's safe, same as an `&mut LinkedList`.
+        bump(unsafe { &mut self.cache.as_mut().list }, self.node);
+    }
+
     /// Access the key only, without updating the LRU order.
     #[inline(always)]
     #[must_use]
@@ -1198,11 +1267,7 @@ impl<K, V> SmartEntry<'_, K, V> {
     /// as it is assumed that the caller is actively using the value.
     #[must_use]
     pub fn get(&mut self) -> (&K, &mut V) {
-        // SAFETY: We tied the lifetime of the pointer to 'a, the same as the LRUCache,
-        // so it will always be valid here. Furthermore, because it's a raw pointer,
-        // SmartEntry is not Send/Sync, so as long as the mutability happens right
-        // here and now, it's safe, same as an `&mut LinkedList`.
-        bump(unsafe { self.list.as_mut() }, self.node);
+        self.bump();
 
         // SAFETY: We have exclusive access to the Node
         unsafe { (&self.node.key, self.node.value.get_mut()) }
@@ -1217,12 +1282,52 @@ impl<K, V> SmartEntry<'_, K, V> {
     /// updating the LRU order in the process.
     #[inline(always)]
     pub fn get_value(&mut self) -> &mut V {
-        self.get().1
+        self.bump();
+
+        // SAFETY: We have exclusive access to the Node
+        unsafe { self.node.value.get_mut() }
+    }
+
+    /// Returns `true` if this entry is the most recently used in the cache.
+    #[must_use]
+    pub fn is_most_recent(&self) -> bool {
+        // SAFETY: This pointer is the same as a mutable reference to the list
+        let list = unsafe { &self.cache.as_ref().list };
+
+        // SAFETY: We know the list is non-empty, so front is always valid
+        core::ptr::eq(self.node, unsafe { list.front().get().unwrap_unchecked() })
+    }
+}
+
+impl<K, V> SmartEntry<'_, K, V, sealed::CanRemove> {
+    /// Removes the key-value pair from the cache, and returns the key and value.
+    ///
+    /// This cannot be called on every `SmartEntry`. For example, [`LRUCache::smart_iter`]
+    /// does not allow for removal of entries, so the `SmartEntry` it yields will not have
+    /// this method available. It can, however, still update the LRU order on mutable access.
+    ///
+    /// Consider using [`LRUCache::retain`] to remove entries based on a predicate.
+    #[must_use]
+    pub fn remove(self) -> (K, V) {
+        // SAFETY: node being `&Node<K, V>` is safe here because it's lifetime is actually
+        // kind of decoupled from the intrusive structures themselves
+        let SmartEntry { node, mut cache, .. } = self;
+
+        // SAFETY: We have exclusive access to the cache given the SmartEntry lifetime
+        let cache = unsafe { cache.as_mut() };
+
+        // SAFETY: Removing the node from the tree is safe, as it's a known valid pointer
+        unsafe { cache.tree.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+
+        // SAFETY: Removing the node from the list is also safe for similar reasons
+        let ptr = unsafe { cache.list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+
+        // SAFETY: Node has been removed from both the tree and list
+        unsafe { Node::unwrap(ptr) }
     }
 }
 
 impl<K, V> Drop for LRUCache<K, V> {
-    #[inline]
     fn drop(&mut self) {
         self.clear();
     }
@@ -1317,8 +1422,7 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
 }
 
 impl<K, V> Drop for IntoIter<K, V> {
-    #[inline]
     fn drop(&mut self) {
-        drop_list(&mut self.list);
+        clear_list(&mut self.list);
     }
 }
