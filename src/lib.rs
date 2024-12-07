@@ -1229,6 +1229,53 @@ impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
     }
 }
 
+impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
+    /// With the lifetime of the `LRUCache` itself,
+    /// access the key-value pair and update the LRU order.
+    ///
+    /// It's not possible to have multiple `SmartEntry` instances, nor
+    /// more than one mutable reference to the cache value at a time,
+    /// but this allows the reference to outlive the `SmartEntry` itself.
+    ///
+    /// See also [`SmartEntry::get`].
+    ///
+    /// # Error Example
+    ///
+    /// With the returned references being tied to the LRU cache itself,
+    /// it's not possible to borrow it mutably more than once at a time,
+    /// even after dropping the `SmartEntry`.
+    ///
+    /// ```rust,compile_fail
+    /// # use intrusive_lru_cache::LRUCache;
+    /// # let mut lru: LRUCache<u32, u32> = LRUCache::unbounded();
+    /// let mut entry = lru.smart_get(&1).unwrap();
+    ///
+    /// let (key, value) = entry.into_mut();
+    ///
+    /// // error[E0499]: cannot borrow `lru` as mutable more than once at a tim
+    /// let another_entry = lru.smart_get(&1).unwrap();
+    ///
+    /// drop((key, value)); // pretend to use the value later
+    /// ```
+    #[must_use]
+    pub fn into_mut(mut self) -> (&'a K, &'a mut V) {
+        self.bump();
+
+        // SAFETY: We have exclusive access to the Node for the duration of 'a
+        unsafe { (&self.node.key, self.node.value.get_mut()) }
+    }
+
+    /// With the lifetime of the `LRUCache` itself,
+    /// access the key-value pair without updating the LRU order.
+    ///
+    /// See also [`SmartEntry::peek`] and [`SmartEntry::into_mut`].
+    #[inline(always)]
+    #[must_use]
+    pub fn into_ref(self) -> (&'a K, &'a V) {
+        (&self.node.key, self.node.value.get())
+    }
+}
+
 impl<K, V, R> SmartEntry<'_, K, V, R> {
     fn bump(&mut self) {
         // SAFETY: We tied the lifetime of the pointer to 'a, the same as the LRUCache,
@@ -1246,6 +1293,8 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
     }
 
     /// Access the key-value pair immutably, without updating the LRU order.
+    ///
+    /// See also [`SmartEntry::into_ref`].
     #[inline(always)]
     #[must_use]
     pub fn peek(&self) -> (&K, &V) {
@@ -1265,6 +1314,8 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
     ///
     /// The LRU order is updated every time this method is called,
     /// as it is assumed that the caller is actively using the value.
+    ///
+    /// See also [`SmartEntry::into_mut`].
     #[must_use]
     pub fn get(&mut self) -> (&K, &mut V) {
         self.bump();

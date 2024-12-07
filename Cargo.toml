@@ -1,6 +1,6 @@
 [package]
 name = "intrusive-lru-cache"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["novacrazy <novacrazy@gmail.com>"]
 description = "An LRU cache implementation using intrusive data structures"
