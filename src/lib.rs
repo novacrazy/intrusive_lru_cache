@@ -1252,7 +1252,7 @@ impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
     ///
     /// let (key, value) = entry.into_mut();
     ///
-    /// // error[E0499]: cannot borrow `lru` as mutable more than once at a tim
+    /// // error[E0499]: cannot borrow `lru` as mutable more than once at a time
     /// let another_entry = lru.smart_get(&1).unwrap();
     ///
     /// drop((key, value)); // pretend to use the value later
