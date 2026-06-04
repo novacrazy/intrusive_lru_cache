@@ -1,7 +1,8 @@
 [package]
 name = "intrusive-lru-cache"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.84"
 authors = ["novacrazy <novacrazy@gmail.com>"]
 description = "An LRU cache implementation using intrusive data structures"
 categories = ["data-structures"]
@@ -13,7 +14,7 @@ repository = "https://github.com/novacrazy/intrusive_lru_cache"
 documentation = "https://docs.rs/intrusive-lru-cache"
 
 [dependencies]
-intrusive-collections = "0.9.7"
+intrusive-collections = "0.10"
 
 [features]
 default = ["atomic"]

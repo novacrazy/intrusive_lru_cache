@@ -1,0 +1,89 @@
+name: Build
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --all-features
+
+      - name: Test
+        run: cargo test --all-features
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --component miri
+          cargo miri setup
+
+      # This crate's internal `unsafe` is exercised heavily by the tests, so it
+      # must be sound under both aliasing models. Stacked Borrows is the default;
+      # Tree Borrows is run explicitly as well.
+      - name: Test with Miri (Stacked Borrows)
+        run: cargo miri test --all-features
+
+      - name: Test with Miri (Tree Borrows)
+        run: cargo miri test --all-features
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Runs on every push/PR so a coverage regression that fails to build is
+      # caught early. `jq` is preinstalled on the ubuntu runners.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --all-features --json --summary-only > coverage.json
+          COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
+          COVERAGE=$(printf '%.1f' "$COVERAGE")
+          echo "COVERAGE=$COVERAGE" >> "$GITHUB_ENV"
+          echo "Line coverage: $COVERAGE%"
+
+      # Only publish the badge from pushes to master. PRs (especially from forks)
+      # cannot read GIST_SECRET, so this step is skipped there rather than failing.
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: schneegans/dynamic-badges-action@v1.8.0
+        with:
+          auth: ${{ secrets.GIST_SECRET }}
+          gistID: 7270c68e5927fa2a1ef2de9f4286010b
+          filename: intrusive-lru-cache-coverage.json
+          label: coverage
+          message: ${{ env.COVERAGE }}%
+          valColorRange: ${{ env.COVERAGE }}
+          minColorRange: 50
+          maxColorRange: 95

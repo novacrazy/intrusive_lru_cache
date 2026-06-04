@@ -26,6 +26,8 @@ use intrusive_collections::intrusive_adapter;
 use intrusive_collections::rbtree::Entry as RBTreeEntry;
 use intrusive_collections::{KeyAdapter, LinkedList, RBTree, UnsafeRef};
 
+/// Re-export of [`intrusive_collections::Bound`], used by the `smart_*_bound`
+/// methods such as [`LRUCache::smart_upper_bound`] and [`LRUCache::smart_lower_bound`].
 pub use intrusive_collections::Bound;
 
 /// Utility function to convert a `Bound<&Q>` to `Bound<&Borrowed<Q>>`.
@@ -99,12 +101,25 @@ struct Node<K, V> {
 impl<K, V> Node<K, V> {
     #[inline(always)]
     fn new(key: K, value: V) -> UnsafeRef<Self> {
-        UnsafeRef::from_box(Box::new(Self {
+        let ptr = Box::into_raw(Box::new(Self {
             list_link: LinkedListLink::new(),
             tree_link: RBTreeLink::new(),
             key,
             value: Value::new(value),
-        }))
+        }));
+
+        // Expose the allocation's write provenance up front. The collections
+        // only ever hand back `&Node` (read-only provenance), so removal and
+        // deallocation re-derive a pointer from a reference's address via
+        // [`expose_node`]; that re-derivation can only recover write access if a
+        // write-capable tag for this allocation has been exposed. See
+        // [`expose_node`] for the full rationale.
+        let _ = ptr.expose_provenance();
+
+        // SAFETY: `ptr` was just produced by `Box::into_raw`, so it is a valid,
+        // non-null, uniquely-owned pointer suitable for `UnsafeRef::from_raw`
+        // (and later `UnsafeRef::into_box`).
+        unsafe { UnsafeRef::from_raw(ptr) }
     }
 
     /// Assumes the node is not in any collections, and extracts the key/value
@@ -119,8 +134,8 @@ impl<K, V> Node<K, V> {
     }
 }
 
-intrusive_adapter!(NodeListAdapter<K, V> = UnsafeRef<Node<K, V>>: Node<K, V> { list_link: LinkedListLink });
-intrusive_adapter!(NodeTreeAdapter<K, V> = UnsafeRef<Node<K, V>>: Node<K, V> { tree_link: RBTreeLink });
+intrusive_adapter!(NodeListAdapter<K, V> = UnsafeRef<Node<K, V>>: Node<K, V> { list_link => LinkedListLink });
+intrusive_adapter!(NodeTreeAdapter<K, V> = UnsafeRef<Node<K, V>>: Node<K, V> { tree_link => RBTreeLink });
 
 // Because KeyAdapter returns a reference, and `find` uses the returned type as `K`,
 // I ran into issues where `&K: Borrow<Q>` was not satisfied. Therefore, we need
@@ -204,7 +219,7 @@ impl<'a, K: 'a, V> KeyAdapter<'a> for NodeTreeAdapter<K, V> {
 /// # Notes
 /// - Cloning preserves LRU order.
 /// - If the `atomic` crate feature is enabled,
-///     the cache is thread-safe if `K` and `V` are `Send`/`Sync`.
+///   the cache is thread-safe if `K` and `V` are `Send`/`Sync`.
 #[must_use]
 pub struct LRUCache<K, V> {
     list: LinkedList<NodeListAdapter<K, V>>,
@@ -299,6 +314,26 @@ where
     }
 }
 
+/// Re-derives a raw pointer with full provenance over a node's allocation.
+///
+/// The `&Node` references handed out by `intrusive-collections` (via `.get()`,
+/// tree/list iterators, etc.) only carry *read-only* provenance. Feeding such a
+/// pointer to `cursor_mut_from_ptr(..).remove()` produces an [`UnsafeRef`] that
+/// inherits that read-only provenance, so a later mutation, re-insertion, or
+/// deallocation of the node is undefined behavior — Miri flags it under both
+/// Stacked Borrows ("retag for Unique ... only grants SharedReadOnly") and Tree
+/// Borrows ("deallocation ... is forbidden").
+///
+/// Each node's allocation provenance is *exposed* when it is stored in the
+/// collections (their pointer tagging round-trips pointers through `usize`),
+/// exactly as the `RBTree` already relies on. We therefore recover a usable
+/// pointer from the reference's address. This is the same mechanism that makes
+/// `pop_highest`/`pop_lowest` (which deallocate via the tree) sound.
+#[inline(always)]
+fn expose_node<K, V>(node: &Node<K, V>) -> *const Node<K, V> {
+    core::ptr::with_exposed_provenance(core::ptr::from_ref(node).expose_provenance())
+}
+
 /// Bumps a node to the front of the list, only if it's not already there.
 #[inline]
 fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
@@ -310,8 +345,13 @@ fn bump<K, V>(list: &mut LinkedList<NodeListAdapter<K, V>>, node: &Node<K, V>) {
         return;
     }
 
-    // SAFETY: Cursor created from a known valid pointer
-    let node = unsafe { list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+    // SAFETY: Cursor created from a known valid pointer, re-derived with full
+    // provenance so the removed/re-inserted UnsafeRef stays sound to deallocate.
+    let node = unsafe {
+        list.cursor_mut_from_ptr(expose_node(node))
+            .remove()
+            .unwrap_unchecked()
+    };
 
     list.push_front(node);
 }
@@ -455,8 +495,14 @@ where
                 return;
             }
 
-            // SAFETY: Cursor created from a known valid pointer
-            let node = unsafe { self.list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+            // SAFETY: Cursor created from a known valid pointer, re-derived with
+            // full provenance so the removed/re-inserted UnsafeRef stays sound.
+            let node = unsafe {
+                self.list
+                    .cursor_mut_from_ptr(expose_node(node))
+                    .remove()
+                    .unwrap_unchecked()
+            };
 
             self.list.push_back(node);
         }
@@ -495,7 +541,14 @@ where
     ///
     /// This is an `O(1)` operation.
     pub fn smart_get_oldest(&mut self) -> Option<SmartEntry<'_, K, V>> {
-        Some(SmartEntry::new(self.get_ptr(), self.list.back_mut().into_ref()?))
+        let cache = self.get_ptr();
+
+        // Use a shared cursor (`back`, not `back_mut`): after `get_ptr` produced a
+        // pointer to the whole cache, a *mutable* reborrow of `self` would
+        // invalidate it under Stacked Borrows, whereas a shared one does not.
+        let node = self.list.back().get()?;
+
+        Some(SmartEntry::new(cache, node))
     }
 
     /// Returns an iterator over the key-value pairs in the cache described by the range,
@@ -572,13 +625,16 @@ where
     {
         let cache = self.get_ptr();
 
-        let LRUCache { tree, .. } = self;
-
-        tree.range(
-            Bound::Included(Borrowed::new(min)),
-            Bound::Excluded(Borrowed::new(max)),
-        )
-        .map(move |node| SmartEntry::new(cache, node))
+        // Iterate via a shared borrow of the tree: a mutable reborrow of `self`
+        // (e.g. destructuring `let LRUCache { tree, .. } = self`) would invalidate
+        // the `cache` pointer obtained above under Stacked Borrows. SmartEntry
+        // performs any list mutation later, through `cache`.
+        self.tree
+            .range(
+                Bound::Included(Borrowed::new(min)),
+                Bound::Excluded(Borrowed::new(max)),
+            )
+            .map(move |node| SmartEntry::new(cache, node))
     }
 
     /// Returns a [`SmartEntry`] to the last key-value pair whose key is below
@@ -699,7 +755,7 @@ where
     /// See also [`get_or_insert2`](Self::get_or_insert2) for a version that allows for a borrowed key type.
     ///
     /// This is an `O(log n)` operation.
-    pub fn get_or_insert<F>(&mut self, key: K, f: F) -> GetOrInsertResult<K, V>
+    pub fn get_or_insert<F>(&'_ mut self, key: K, f: F) -> GetOrInsertResult<'_, K, V>
     where
         F: FnOnce() -> V,
     {
@@ -1007,6 +1063,8 @@ impl<K, V> LRUCache<K, V> {
         self.tree.fast_clear();
 
         clear_list(&mut self.list);
+
+        self.size = 0;
     }
 
     /// Removes the oldest entries from the cache until the length is less than or equal to the maximum capacity.
@@ -1192,8 +1250,13 @@ mod sealed {
 /// See [`SmartEntry::peek`] and [`SmartEntry::get`] for more information.
 #[must_use]
 pub struct SmartEntry<'a, K, V, R = sealed::CanRemove> {
-    // NOTE: This reference is valid so long as the `UnsafeRef` that holds it is allocated
-    node: &'a Node<K, V>,
+    // A raw pointer (rather than `&'a Node`) carrying *exposed* provenance over
+    // the node's allocation. Storing a `&Node` would mean every access — and in
+    // particular `remove`'s deallocation — went through read-only provenance,
+    // which is undefined behavior to mutate or free through (see `expose_node`).
+    // The pointer is valid so long as the `UnsafeRef` that holds it is allocated,
+    // which is guaranteed for the borrow of the cache (`'a`).
+    node: NonNull<Node<K, V>>,
     cache: NonNull<LRUCache<K, V>>,
     _marker: core::marker::PhantomData<&'a mut LRUCache<K, V>>,
     _removal: core::marker::PhantomData<R>,
@@ -1219,7 +1282,13 @@ impl<K, V, R> DerefMut for SmartEntry<'_, K, V, R> {
 
 impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
     #[inline(always)]
-    const fn new(cache: NonNull<LRUCache<K, V>>, node: &'a Node<K, V>) -> Self {
+    fn new(cache: NonNull<LRUCache<K, V>>, node: &'a Node<K, V>) -> Self {
+        // Capture the node with full (exposed) provenance up front so later
+        // mutation/removal does not have to launder it back from a `&Node`.
+        // SAFETY: `expose_node` returns a pointer derived from a live reference,
+        // so it is non-null.
+        let node = unsafe { NonNull::new_unchecked(expose_node(node).cast_mut()) };
+
         Self {
             node,
             cache,
@@ -1261,8 +1330,12 @@ impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
     pub fn into_mut(mut self) -> (&'a K, &'a mut V) {
         self.bump();
 
-        // SAFETY: We have exclusive access to the Node for the duration of 'a
-        unsafe { (&self.node.key, self.node.value.get_mut()) }
+        // SAFETY: We have exclusive access to the Node for the duration of 'a,
+        // and the value cell may therefore be accessed mutably.
+        unsafe {
+            let node = self.node.as_ref();
+            (&node.key, node.value.get_mut())
+        }
     }
 
     /// With the lifetime of the `LRUCache` itself,
@@ -1272,7 +1345,9 @@ impl<'a, K, V, R> SmartEntry<'a, K, V, R> {
     #[inline(always)]
     #[must_use]
     pub fn into_ref(self) -> (&'a K, &'a V) {
-        (&self.node.key, self.node.value.get())
+        // SAFETY: The node is valid for `'a`, the borrow of the cache.
+        let node = unsafe { self.node.as_ref() };
+        (&node.key, node.value.get())
     }
 }
 
@@ -1282,14 +1357,15 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
         // so it will always be valid here. Furthermore, because it's a raw pointer,
         // SmartEntry is not Send/Sync, so as long as the mutability happens right
         // here and now, it's safe, same as an `&mut LinkedList`.
-        bump(unsafe { &mut self.cache.as_mut().list }, self.node);
+        bump(unsafe { &mut self.cache.as_mut().list }, unsafe { self.node.as_ref() });
     }
 
     /// Access the key only, without updating the LRU order.
     #[inline(always)]
     #[must_use]
     pub fn key(&self) -> &K {
-        &self.node.key
+        // SAFETY: The node is valid for the borrow of `self`.
+        unsafe { &self.node.as_ref().key }
     }
 
     /// Access the key-value pair immutably, without updating the LRU order.
@@ -1298,7 +1374,9 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
     #[inline(always)]
     #[must_use]
     pub fn peek(&self) -> (&K, &V) {
-        (&self.node.key, self.node.value.get())
+        // SAFETY: The node is valid for the borrow of `self`.
+        let node = unsafe { self.node.as_ref() };
+        (&node.key, node.value.get())
     }
 
     /// Access the value immutably, without updating the LRU order.
@@ -1307,7 +1385,8 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
     #[inline(always)]
     #[must_use]
     pub fn peek_value(&self) -> &V {
-        self.node.value.get()
+        // SAFETY: The node is valid for the borrow of `self`.
+        unsafe { self.node.as_ref() }.value.get()
     }
 
     /// Access the key-value pair, and update the LRU order.
@@ -1320,8 +1399,12 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
     pub fn get(&mut self) -> (&K, &mut V) {
         self.bump();
 
-        // SAFETY: We have exclusive access to the Node
-        unsafe { (&self.node.key, self.node.value.get_mut()) }
+        // SAFETY: We have exclusive access to the Node, and the value cell may
+        // therefore be accessed mutably.
+        unsafe {
+            let node = self.node.as_ref();
+            (&node.key, node.value.get_mut())
+        }
     }
 
     /// Access the value mutably, and update the LRU order.
@@ -1336,7 +1419,7 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
         self.bump();
 
         // SAFETY: We have exclusive access to the Node
-        unsafe { self.node.value.get_mut() }
+        unsafe { self.node.as_ref().value.get_mut() }
     }
 
     /// Returns `true` if this entry is the most recently used in the cache.
@@ -1346,7 +1429,9 @@ impl<K, V, R> SmartEntry<'_, K, V, R> {
         let list = unsafe { &self.cache.as_ref().list };
 
         // SAFETY: We know the list is non-empty, so front is always valid
-        core::ptr::eq(self.node, unsafe { list.front().get().unwrap_unchecked() })
+        let front = unsafe { list.front().get().unwrap_unchecked() };
+
+        core::ptr::eq(self.node.as_ptr().cast_const(), front)
     }
 }
 
@@ -1360,18 +1445,24 @@ impl<K, V> SmartEntry<'_, K, V, sealed::CanRemove> {
     /// Consider using [`LRUCache::retain`] to remove entries based on a predicate.
     #[must_use]
     pub fn remove(self) -> (K, V) {
-        // SAFETY: node being `&Node<K, V>` is safe here because it's lifetime is actually
-        // kind of decoupled from the intrusive structures themselves
         let SmartEntry { node, mut cache, .. } = self;
 
         // SAFETY: We have exclusive access to the cache given the SmartEntry lifetime
         let cache = unsafe { cache.as_mut() };
+
+        // The stored pointer carries exposed provenance over the whole node
+        // allocation (captured in `new`), so the `UnsafeRef` produced below is
+        // sound to deallocate. We never re-borrow it as `&Node` here, which would
+        // otherwise leave a read-only reference live across the deallocation.
+        let node = node.as_ptr();
 
         // SAFETY: Removing the node from the tree is safe, as it's a known valid pointer
         unsafe { cache.tree.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
 
         // SAFETY: Removing the node from the list is also safe for similar reasons
         let ptr = unsafe { cache.list.cursor_mut_from_ptr(node).remove().unwrap_unchecked() };
+
+        cache.size -= 1;
 
         // SAFETY: Node has been removed from both the tree and list
         unsafe { Node::unwrap(ptr) }
